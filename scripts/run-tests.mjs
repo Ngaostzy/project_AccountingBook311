@@ -20,8 +20,11 @@ global.document = {
   addEventListener: () => {}
 };
 global.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
-global.navigator = { onLine: true };
-
+Object.defineProperty(globalThis, 'navigator', {
+  value: { onLine: true },
+  configurable: true,
+  writable: true
+});
 eval(scriptMatch[1]);
 const results = global.ThuTienSachEngine.runAutomatedTests();
 let failed = 0;

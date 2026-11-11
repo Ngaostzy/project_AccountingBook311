@@ -4076,6 +4076,160 @@
     }
 
     // Mục 6: Kiểm tra 10 bước trước khi khôi phục JSON / JSON.GZ + Kiểm tra ảnh thiếu trong Storage (Mục 2)
+
+    // Tự động nâng cấp file JSON xuất từ phiên bản v1 (như Tien_sach_10-11.json chưa có trường metadata) sang chuẩn v2.1.0
+    function normalizeLegacyV1BackupIfNeeded(parsed, currentDb) {
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return parsed;
+      if (parsed.metadata) return parsed; // Đã có metadata thì giữ nguyên để kiểm tra schemaVersion chuẩn
+      if (!Array.isArray(parsed.classes) || !Array.isArray(parsed.students) || !Array.isArray(parsed.books) || !Array.isArray(parsed.transactions)) {
+        return parsed;
+      }
+
+      const dbClassesByName = new Map((currentDb.classes || []).map(c => [c.name, c]));
+      const dbStudentsByKey = new Map((currentDb.students || []).map(s => [`${s.className}::${Number(s.stt)}`, s]));
+      const oldStudentIdToUuid = new Map();
+
+      const normClasses = parsed.classes.map(c => {
+        const matched = dbClassesByName.get(c.name);
+        return {
+          id: matched ? matched.id : (c.id || generateUUID()),
+          ownerId: OWNER_UUID,
+          name: c.name,
+          grade: Number(c.grade),
+          teacherName: c.teacherName || (matched ? matched.teacherName : ""),
+          schoolYear: c.schoolYear || "2026-2027"
+        };
+      });
+
+      const normClassesByName = new Map(normClasses.map(c => [c.name, c]));
+
+      const normStudents = parsed.students.map(s => {
+        const key = `${s.className}::${Number(s.stt)}`;
+        const matchedSt = dbStudentsByKey.get(key);
+        const matchedCls = normClassesByName.get(s.className);
+        const newId = matchedSt ? matchedSt.id : (s.id || generateUUID());
+        if (s.id) oldStudentIdToUuid.set(s.id, newId);
+        return {
+          id: newId,
+          ownerId: OWNER_UUID,
+          classId: matchedCls ? matchedCls.id : (s.classId || ""),
+          className: s.className,
+          stt: Number(s.stt),
+          fullName: s.fullName,
+          grade: Number(s.grade),
+          school: s.school || "",
+          facebookUrl: s.facebookUrl || "",
+          parentName: s.parentName || "",
+          parentPhone: s.parentPhone || "",
+          status: s.status || "studying",
+          note: s.note || ""
+        };
+      });
+
+      const normBooks = parsed.books.map(b => ({
+        id: b.id,
+        ownerId: OWNER_UUID,
+        code: b.code,
+        title: b.title,
+        grade: Number(b.grade),
+        price: Number(b.price),
+        status: b.status || "selling",
+        note: b.note || ""
+      }));
+
+      const normTransactions = parsed.transactions.map(t => {
+        const mappedStudentId = oldStudentIdToUuid.get(t.studentId) || t.studentId;
+        const matchedCls = normClassesByName.get(t.className);
+        const snap = Number(t.bookPriceSnapshot ?? t.bookPriceAtTransaction ?? t.amountDue ?? 0);
+        const due = Number(t.amountDue ?? snap);
+        const rec = Number(t.amountReceived ?? snap);
+        return {
+          id: t.id,
+          transactionCode: t.transactionCode || t.id,
+          idempotencyKey: t.idempotencyKey || `${mappedStudentId}::${t.bookId}::${t.id}`,
+          ownerId: OWNER_UUID,
+          studentId: mappedStudentId,
+          studentName: t.studentName || "",
+          stt: Number(t.stt || 1),
+          classId: t.classId || (matchedCls ? matchedCls.id : ""),
+          className: t.className || "",
+          grade: Number(t.grade || 10),
+          bookId: t.bookId,
+          bookCode: t.bookCode || "",
+          bookTitle: t.bookTitle || "",
+          bookPriceSnapshot: snap,
+          bookPriceAtTransaction: snap,
+          amountDue: due,
+          amountReceived: rec,
+          balanceAfter: Number(t.balanceAfter ?? Math.max(0, due - rec)),
+          type: t.type || "Thu tiền",
+          paymentMethod: t.paymentMethod || "Tiền mặt",
+          imageId: t.imageId || "",
+          createdAt: t.createdAt || new Date().toISOString(),
+          note: t.note || "",
+          status: t.status === "Đã hủy" ? "Đã hủy" : "Hoạt động",
+          cancelReason: t.cancelReason || "",
+          refTransactionId: t.refTransactionId || ""
+        };
+      });
+
+      const normImages = sanitizeTransactionImagesForJsonBackup(parsed.transactionImages || parsed.transaction_images || [], OWNER_UUID);
+      const normAuditLogs = Array.isArray(parsed.auditLogs) ? parsed.auditLogs : (Array.isArray(parsed.audit_logs) ? parsed.audit_logs : []);
+      const normSettings = [
+        {
+          id: "SETTINGS_MAIN",
+          ownerId: OWNER_UUID,
+          appName: "THU TIỀN SÁCH",
+          currency: "VND",
+          timezone: "Asia/Ho_Chi_Minh",
+          autoBackupEnabled: false,
+          autoBackupCronConfigured: false,
+          migrationCompleted: true
+        }
+      ];
+
+      const recordCounts = {
+        classes: normClasses.length,
+        students: normStudents.length,
+        books: normBooks.length,
+        transactions: normTransactions.length,
+        transactionImages: normImages.length,
+        auditLogs: normAuditLogs.length,
+        settings: normSettings.length
+      };
+
+      const createdAt = (parsed.settings && parsed.settings.lastBackupAt) || new Date().toISOString();
+      const metadataWithoutChecksum = {
+        schemaVersion: JSON_BACKUP_SCHEMA_VERSION,
+        appVersion: APP_VERSION,
+        backupVersion: JSON_BACKUP_VERSION,
+        createdAt,
+        createdBy: OWNER_UUID,
+        format: "json",
+        canonicalAlgorithm: CANONICAL_ALGORITHM_DOC,
+        recordCounts
+      };
+
+      const draft = {
+        metadata: metadataWithoutChecksum,
+        classes: normClasses,
+        students: normStudents,
+        books: normBooks,
+        transactions: normTransactions,
+        transactionImages: normImages,
+        auditLogs: normAuditLogs,
+        settings: normSettings
+      };
+      const checksum = computeSha256HexSync(buildCanonicalJsonForChecksum(draft));
+      return {
+        ...draft,
+        metadata: {
+          ...metadataWithoutChecksum,
+          checksum
+        }
+      };
+    }
+
     async function validateAndPreviewJsonBackup(inputBytesOrString, currentDb, mode = "add_only", options = {}) {
       assertAuthenticated();
       const fileName = options.fileName || "Thu_tien_sach_backup.json";
@@ -4132,6 +4286,9 @@
       if (/service_role|access_token|refresh_token|anon_key|publishable_key/i.test(decodedText)) {
         throw new Error("SECRET_KEY_DETECTED: Phát hiện khóa bí mật hoặc token nhạy cảm trong file sao lưu!");
       }
+
+      // Hỗ trợ nâng cấp tự động nếu người dùng chọn file JSON v1 cũ (như Tien_sach_10-11.json)
+      parsed = normalizeLegacyV1BackupIfNeeded(parsed, currentDb);
 
       // Bước 4: Kiểm tra schemaVersion
       const metadata = parsed.metadata;
@@ -4241,7 +4398,7 @@
       const knownStoragePaths = options.existingStoragePaths instanceof Set
         ? options.existingStoragePaths
         : new Set([
-            ...Array.from(privateTransactionImageBucket.keys()),
+            ...Object.keys(typeof privateImageStore === 'object' && privateImageStore ? privateImageStore : {}),
             ...(currentDb.transaction_images || []).map(im => im.storage_path || im.storagePath).filter(Boolean)
           ]);
 
@@ -8673,6 +8830,9 @@
     document.getElementById("btnOpenTestSuite").addEventListener("click", openTestSuiteModal);
 
     window.ThuTienSachEngine = {
+      validateAndPreviewJsonBackup,
+      executeRestoreFromJsonBackup,
+      createJsonOrGzipBackupArtifact,
       normalizeVN,
       formatVND,
       formatDateTimeVN,
