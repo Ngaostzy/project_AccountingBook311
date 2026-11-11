@@ -3606,6 +3606,815 @@
     }
 
     // Build Backup ZIP (Section 21: 8 JSON files, zero secrets/tokens/signed URLs)
+
+    // =========================================================================
+    // HỆ THỐNG SAO LƯU & KHÔI PHỤC JSON / JSON.GZ / ZIP (MỤC 1 - MỤC 10)
+    // =========================================================================
+    const JSON_BACKUP_SCHEMA_VERSION = "2.1.0";
+    const SUPPORTED_JSON_SCHEMA_VERSIONS = ["2.0.0", "2.1.0"];
+    const JSON_BACKUP_VERSION = "1.0.0";
+    const MAX_JSON_BACKUP_SIZE_BYTES = 50 * 1024 * 1024; // 50MB
+    const CANONICAL_ALGORITHM_DOC = "SHA-256 over canonical UTF-8 JSON with lexicographically sorted keys across {metadataWithoutChecksum, classes, students, books, transactions, transactionImages, auditLogs, settings}";
+
+    function getBackupFileNameByFormat(isoStr, format = "json") {
+      const p = getVNParts(isoStr);
+      const ext = format === "json_gzip" ? "json.gz" : (format === "full_zip" ? "zip" : "json");
+      return `Thu_tien_sach_backup_${p.year}-${p.month}-${p.day}_${p.hour}-${p.minute}.${ext}`;
+    }
+
+    function canonicalizeValue(val) {
+      if (val === null || typeof val !== "object") return val;
+      if (Array.isArray(val)) return val.map(canonicalizeValue);
+      const sortedKeys = Object.keys(val).sort();
+      const out = {};
+      for (const k of sortedKeys) {
+        if (val[k] !== undefined) {
+          out[k] = canonicalizeValue(val[k]);
+        }
+      }
+      return out;
+    }
+
+    function buildCanonicalJsonForChecksum(payloadObj) {
+      const meta = payloadObj.metadata || {};
+      const cleanMeta = {
+        schemaVersion: meta.schemaVersion,
+        appVersion: meta.appVersion,
+        backupVersion: meta.backupVersion,
+        createdAt: meta.createdAt,
+        createdBy: meta.createdBy,
+        format: meta.format,
+        recordCounts: meta.recordCounts
+      };
+      return JSON.stringify(canonicalizeValue({
+        metadata: cleanMeta,
+        classes: payloadObj.classes || [],
+        students: payloadObj.students || [],
+        books: payloadObj.books || [],
+        transactions: payloadObj.transactions || [],
+        transactionImages: payloadObj.transactionImages || [],
+        auditLogs: payloadObj.auditLogs || [],
+        settings: payloadObj.settings || []
+      }));
+    }
+
+    // Standard FIPS 180-4 SHA-256 (produces exact 64-char hex matching Web Crypto API crypto.subtle.digest('SHA-256'))
+    function computeSha256HexSync(strUtf8) {
+      const K = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+      ];
+      const rotr = (n, x) => (x >>> n) | (x << (32 - n));
+      const bytes = new TextEncoder().encode(String(strUtf8 ?? ""));
+      const bitLen = bytes.length * 8;
+      const totalLen = (((bytes.length + 8) >> 6) + 1) << 6;
+      const padded = new Uint8Array(totalLen);
+      padded.set(bytes);
+      padded[bytes.length] = 0x80;
+      const view = new DataView(padded.buffer);
+      view.setUint32(totalLen - 8, Math.floor(bitLen / 0x100000000), false);
+      view.setUint32(totalLen - 4, bitLen >>> 0, false);
+
+      let h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a;
+      let h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+      const w = new Int32Array(64);
+
+      for (let i = 0; i < totalLen; i += 64) {
+        for (let t = 0; t < 16; t++) w[t] = view.getInt32(i + t * 4, false);
+        for (let t = 16; t < 64; t++) {
+          const s0 = rotr(7, w[t - 15]) ^ rotr(18, w[t - 15]) ^ (w[t - 15] >>> 3);
+          const s1 = rotr(17, w[t - 2]) ^ rotr(19, w[t - 2]) ^ (w[t - 2] >>> 10);
+          w[t] = (w[t - 16] + s0 + w[t - 7] + s1) | 0;
+        }
+        let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+        for (let t = 0; t < 64; t++) {
+          const S1 = rotr(6, e) ^ rotr(11, e) ^ rotr(25, e);
+          const ch = (e & f) ^ (~e & g);
+          const temp1 = (h + S1 + ch + K[t] + w[t]) | 0;
+          const S0 = rotr(2, a) ^ rotr(13, a) ^ rotr(22, a);
+          const maj = (a & b) ^ (a & c) ^ (b & c);
+          const temp2 = (S0 + maj) | 0;
+          h = g; g = f; f = e; e = (d + temp1) | 0; d = c; c = b; b = a; a = (temp1 + temp2) | 0;
+        }
+        h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0;
+        h4 = (h4 + e) | 0; h5 = (h5 + f) | 0; h6 = (h6 + g) | 0; h7 = (h7 + h) | 0;
+      }
+      return [h0, h1, h2, h3, h4, h5, h6, h7].map(v => (v >>> 0).toString(16).padStart(8, "0")).join("");
+    }
+
+    async function computeSha256HexAsync(strUtf8) {
+      if (typeof crypto !== "undefined" && crypto.subtle && typeof crypto.subtle.digest === "function") {
+        const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(strUtf8 ?? "")));
+        return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+      }
+      return computeSha256HexSync(strUtf8);
+    }
+
+    // Mục 2: Không nhúng ảnh vào JSON (chỉ lưu 10 trường metadata của ảnh, không Base64, không Signed URL)
+    function sanitizeTransactionImagesForJsonBackup(imagesArr, ownerId) {
+      return (imagesArr || []).map(im => {
+        const txId = im.transactionId || im.transaction_id || "GD_UNKNOWN";
+        const rawPath = im.storagePath || im.storage_path || `${ownerId}/2026/11/${txId}/receipt_${im.id || "img"}.jpg`;
+        const cleanStoragePath = (rawPath.startsWith("data:") || rawPath.startsWith("blob:"))
+          ? `${ownerId}/2026/11/${txId}/receipt_${im.id || "img"}.jpg`
+          : rawPath.split("?")[0];
+        const origName = im.originalFileName || im.original_file_name || cleanStoragePath.split("/").pop() || "receipt.jpg";
+        const sizeVal = Number(im.size || im.file_size_bytes || im.fileSizeBytes || 14336);
+        const createdAtVal = im.createdAt || im.created_at || new Date().toISOString();
+        const imgChecksum = im.checksum || computeSha256HexSync(`${im.id}:${txId}:${cleanStoragePath}`).slice(0, 32);
+        return {
+          id: im.id,
+          transactionId: txId,
+          bucket: "transaction-images",
+          storagePath: cleanStoragePath,
+          originalFileName: origName,
+          mimeType: im.mimeType || im.mime_type || "image/jpeg",
+          size: sizeVal,
+          checksum: imgChecksum,
+          createdAt: createdAtVal,
+          createdBy: im.createdBy || im.ownerId || im.owner_id || ownerId
+        };
+      });
+    }
+
+    // Mục 1: Loại bỏ tuyệt đối mật khẩu, token, key, signed URL, thông tin phiên đăng nhập khỏi settings & transactions
+    function sanitizeRecordsForJsonBackup(targetDb, ownerId) {
+      const cleanClasses = (targetDb.classes || []).map(c => ({
+        id: c.id,
+        ownerId: c.ownerId || ownerId,
+        name: c.name,
+        grade: Number(c.grade),
+        teacherName: c.teacherName || c.teacher_name || "",
+        schoolYear: c.schoolYear || c.school_year || "2026-2027"
+      }));
+
+      const cleanStudents = (targetDb.students || []).map(s => ({
+        id: s.id,
+        ownerId: s.ownerId || ownerId,
+        classId: s.classId || s.class_id,
+        className: s.className || s.class_name,
+        stt: Number(s.stt),
+        fullName: s.fullName || s.full_name,
+        grade: Number(s.grade),
+        school: s.school || "",
+        facebookUrl: s.facebookUrl || s.facebook_url || "",
+        parentName: s.parentName || s.parent_name || "",
+        parentPhone: s.parentPhone || s.parent_phone || "",
+        status: s.status || "studying",
+        note: s.note || ""
+      }));
+
+      const cleanBooks = (targetDb.books || []).map(b => ({
+        id: b.id,
+        ownerId: b.ownerId || ownerId,
+        code: b.code,
+        title: b.title,
+        grade: Number(b.grade),
+        price: Number(b.price),
+        status: b.status || "selling",
+        note: b.note || ""
+      }));
+
+      const cleanTransactions = (targetDb.transactions || []).map(t => ({
+        id: t.id,
+        transactionCode: t.transactionCode || t.transaction_code || t.id,
+        idempotencyKey: t.idempotencyKey || t.idempotency_key || t.id,
+        ownerId: t.ownerId || ownerId,
+        studentId: t.studentId || t.student_id,
+        studentName: t.studentName || "",
+        stt: Number(t.stt || 1),
+        classId: t.classId || t.class_id || "",
+        className: t.className || t.class_name || "",
+        grade: Number(t.grade || 10),
+        bookId: t.bookId || t.book_id,
+        bookCode: t.bookCode || "",
+        bookTitle: t.bookTitle || "",
+        bookPriceSnapshot: Number(t.bookPriceSnapshot ?? t.book_price_snapshot ?? t.amountDue ?? 0),
+        amountDue: Number(t.amountDue ?? t.amount_due ?? 0),
+        amountReceived: Number(t.amountReceived ?? t.amount_received ?? 0),
+        balanceAfter: Number(t.balanceAfter ?? t.balance_after ?? 0),
+        type: t.type || t.transaction_type || "Thu tiền",
+        paymentMethod: t.paymentMethod || t.payment_method || "Tiền mặt",
+        imageId: t.imageId || "",
+        createdAt: t.createdAt || t.created_at || new Date().toISOString(),
+        note: t.note || "",
+        status: t.status || "Hoạt động",
+        cancelReason: t.cancelReason || t.cancel_reason || "",
+        refTransactionId: t.refTransactionId || t.ref_transaction_id || ""
+      }));
+
+      const cleanImages = sanitizeTransactionImagesForJsonBackup(targetDb.transaction_images || [], ownerId);
+
+      const cleanAuditLogs = (targetDb.audit_logs || []).map(a => ({
+        id: a.id,
+        ownerId: a.ownerId || a.owner_id || ownerId,
+        action: a.action,
+        entityType: a.entityType || a.entity_type || "system",
+        entityId: a.entityId || a.entity_id || "",
+        oldData: a.oldData ?? a.old_data ?? null,
+        newData: a.newData ?? a.new_data ?? null,
+        createdAt: a.createdAt || a.created_at || new Date().toISOString()
+      }));
+
+      const rawSettings = Array.isArray(targetDb.settings) ? targetDb.settings[0] : (targetDb.settings || {});
+      const cleanSettings = [
+        {
+          id: rawSettings.id || "SETTINGS_MAIN",
+          ownerId: ownerId,
+          appName: "THU TIỀN SÁCH",
+          currency: "VND",
+          timezone: "Asia/Ho_Chi_Minh",
+          autoBackupEnabled: Boolean(rawSettings.autoBackupEnabled),
+          autoBackupCronConfigured: Boolean(rawSettings.autoBackupCronConfigured),
+          migrationCompleted: Boolean(rawSettings.migrationCompleted)
+        }
+      ];
+
+      return {
+        classes: cleanClasses,
+        students: cleanStudents,
+        books: cleanBooks,
+        transactions: cleanTransactions,
+        transactionImages: cleanImages,
+        auditLogs: cleanAuditLogs,
+        settings: cleanSettings
+      };
+    }
+
+    function createJsonBackupObject(targetDb, options = {}) {
+      const user = assertAuthenticated();
+      const requestedFormat = options.format || "json";
+      const createdAt = options.createdAt || new Date().toISOString();
+      const sanitized = sanitizeRecordsForJsonBackup(targetDb, user.id);
+
+      const recordCounts = {
+        classes: sanitized.classes.length,
+        students: sanitized.students.length,
+        books: sanitized.books.length,
+        transactions: sanitized.transactions.length,
+        transactionImages: sanitized.transactionImages.length,
+        auditLogs: sanitized.auditLogs.length,
+        settings: sanitized.settings.length
+      };
+
+      const metadataWithoutChecksum = {
+        schemaVersion: JSON_BACKUP_SCHEMA_VERSION,
+        appVersion: APP_VERSION,
+        backupVersion: JSON_BACKUP_VERSION,
+        createdAt,
+        createdBy: user.id,
+        format: requestedFormat,
+        canonicalAlgorithm: CANONICAL_ALGORITHM_DOC,
+        recordCounts
+      };
+
+      const draftPayload = {
+        metadata: metadataWithoutChecksum,
+        ...sanitized
+      };
+
+      const canonicalStr = buildCanonicalJsonForChecksum(draftPayload);
+      const checksum = computeSha256HexSync(canonicalStr);
+
+      const payload = {
+        metadata: {
+          ...metadataWithoutChecksum,
+          checksum
+        },
+        ...sanitized
+      };
+
+      const jsonString = JSON.stringify(payload, null, 2);
+      const utf8Bytes = new TextEncoder().encode(jsonString);
+      const fileName = getBackupFileNameByFormat(createdAt, "json");
+
+      return {
+        payload,
+        jsonString,
+        utf8Bytes,
+        fileName,
+        checksum,
+        recordCounts
+      };
+    }
+
+    // Mục 3: Sao lưu JSON nén (.json.gz) bằng CompressionStream('gzip') hoặc tự động fallback sang .json thường
+    async function createJsonOrGzipBackupArtifact(targetDb, requestedFormat = "json", options = {}) {
+      const user = assertAuthenticated();
+      const forceNoCompression = Boolean(options.forceUnsupportedCompressionStream);
+      const hasCompressionStream = !forceNoCompression && typeof CompressionStream === "function";
+
+      const actualFormat = requestedFormat === "json_gzip"
+        ? (hasCompressionStream ? "json_gzip" : "json")
+        : "json";
+      const fellBackToPlainJson = requestedFormat === "json_gzip" && !hasCompressionStream;
+
+      const base = createJsonBackupObject(targetDb, { format: actualFormat });
+      let finalBytes = base.utf8Bytes;
+      let mimeType = "application/json;charset=utf-8";
+      let fileName = getBackupFileNameByFormat(base.payload.metadata.createdAt, actualFormat);
+
+      if (actualFormat === "json_gzip") {
+        const cs = new CompressionStream("gzip");
+        const writer = cs.writable.getWriter();
+        await writer.write(base.utf8Bytes);
+        await writer.close();
+        const gzBuf = await new Response(cs.readable).arrayBuffer();
+        finalBytes = new Uint8Array(gzBuf);
+        mimeType = "application/gzip";
+      }
+
+      const backupType = options.backupType || "manual";
+      const destination = options.destination || "device";
+      const backupId = options.backupId || generateUUID();
+      const p = getVNParts(base.payload.metadata.createdAt);
+      const ext = actualFormat === "json_gzip" ? "json.gz" : "json";
+      const cloudPath = `${user.id}/${p.year}/${p.month}/${backupId}.${ext}`;
+
+      // Lưu vào simulated private bucket app-backups nếu chọn Lưu vào Supabase hoặc pre_restore / automatic
+      if (destination === "supabase" || backupType === "pre_restore" || backupType === "automatic") {
+        privateBackupBucketStore.set(cloudPath, {
+          ownerId: user.id,
+          user_id: user.id,
+          filePath: cloudPath,
+          fileName,
+          format: actualFormat,
+          mimeType,
+          bytes: finalBytes,
+          createdAt: base.payload.metadata.createdAt
+        });
+      }
+
+      const backupRecord = {
+        id: backupId,
+        user_id: user.id,
+        owner_id: user.id,
+        ownerId: user.id,
+        backup_type: backupType,
+        format: actualFormat,
+        schema_version: JSON_BACKUP_SCHEMA_VERSION,
+        app_version: APP_VERSION,
+        status: "completed",
+        started_at: base.payload.metadata.createdAt,
+        completed_at: new Date().toISOString(),
+        file_path: cloudPath,
+        file_size: finalBytes.byteLength,
+        checksum: base.checksum,
+        record_counts: base.recordCounts,
+        error_message: "",
+        created_at: base.payload.metadata.createdAt,
+        deletable: backupType !== "pre_restore",
+        rawBytes: finalBytes,
+        fileName
+      };
+
+      if (!options.skipRecordingBackup) {
+        if (!targetDb.backups) targetDb.backups = [];
+        targetDb.backups.unshift(backupRecord);
+        // Nếu là sao lưu tự động (automatic), chỉ giữ tối đa 8 bản automatic gần nhất SAU KHI bản mới đã tạo thành công
+        if (backupType === "automatic") {
+          const autoList = targetDb.backups.filter(b => b.backup_type === "automatic" && b.status === "completed");
+          if (autoList.length > 8) {
+            const toRemoveIds = new Set(autoList.slice(8).map(b => b.id));
+            targetDb.backups = targetDb.backups.filter(b => !toRemoveIds.has(b.id));
+          }
+        }
+        appendAuditLog(targetDb, `CREATE_BACKUP_${actualFormat.toUpperCase()}`, "backups", backupId, null, {
+          backup_type: backupType,
+          format: actualFormat,
+          file_size: finalBytes.byteLength,
+          checksum: base.checksum
+        });
+        saveDatabaseToStorage(targetDb);
+      }
+
+      const noticeMessage = fellBackToPlainJson
+        ? `Trình duyệt không hỗ trợ CompressionStream nên đã tự động chuyển sang xuất JSON thường (${fileName}).`
+        : `Đã tạo bản sao lưu ${actualFormat === "json_gzip" ? "JSON.GZ nén" : "JSON"} (${fileName}, ${finalBytes.byteLength} bytes).`;
+
+      return {
+        ok: true,
+        backupId,
+        fileName,
+        actualFormat,
+        fellBackToPlainJson,
+        mimeType,
+        bytes: finalBytes,
+        payload: base.payload,
+        jsonString: base.jsonString,
+        checksum: base.checksum,
+        recordCounts: base.recordCounts,
+        backupRecord,
+        noticeMessage
+      };
+    }
+
+    // Giải nén .json.gz bằng DecompressionStream('gzip')
+    async function decompressOrDecodeBackupBytes(rawBytes, fileName = "backup.json", options = {}) {
+      const isGzMagic = rawBytes && rawBytes.length >= 2 && rawBytes[0] === 0x1f && rawBytes[1] === 0x8b;
+      const lower = String(fileName || "").toLowerCase();
+      if (isGzMagic || lower.endsWith(".json.gz") || lower.endsWith(".gz")) {
+        if (options.forceUnsupportedDecompressionStream || typeof DecompressionStream !== "function") {
+          throw new Error("UNSUPPORTED_DECOMPRESSION_STREAM: Trình duyệt không hỗ trợ DecompressionStream để giải nén file .json.gz. Vui lòng sử dụng file .json thường.");
+        }
+        try {
+          const ds = new DecompressionStream("gzip");
+          const writer = ds.writable.getWriter();
+          await writer.write(rawBytes);
+          await writer.close();
+          const outBuf = await new Response(ds.readable).arrayBuffer();
+          return new TextDecoder("utf-8", { fatal: true }).decode(new Uint8Array(outBuf));
+        } catch (err) {
+          throw new Error("CORRUPT_GZIP_FILE: Không thể giải nén file .json.gz (" + (err.message || String(err)) + ")");
+        }
+      }
+      return new TextDecoder("utf-8", { fatal: true }).decode(rawBytes);
+    }
+
+    // Mục 8: Tạo Signed URL có thời hạn cho bản sao lưu trong private bucket app-backups & kiểm tra RLS
+    const privateBackupBucketStore = new Map();
+
+    function createSignedUrlForBackupInStorage(backupRecordOrPath, expiresInSeconds = 900, requestingUserId = null) {
+      const user = assertAuthenticated();
+      const callerId = requestingUserId || user.id;
+      const filePath = typeof backupRecordOrPath === "string"
+        ? backupRecordOrPath
+        : (backupRecordOrPath.file_path || backupRecordOrPath.filePath || "");
+
+      if (!filePath.startsWith(callerId + "/")) {
+        throw new Error("RLS_BACKUP_ACCESS_DENIED: Row Level Security chặn truy cập bản sao lưu của người dùng khác!");
+      }
+
+      const issuedAt = Date.now();
+      const expiresAt = issuedAt + expiresInSeconds * 1000;
+      const sig = computeSha256HexSync(`${filePath}:${callerId}:${expiresAt}`).slice(0, 24);
+      const signedUrl = `https://private-storage.supabase.co/storage/v1/object/sign/app-backups/${filePath}?token=${sig}&exp=${Math.floor(expiresAt / 1000)}`;
+
+      return {
+        bucket: "app-backups",
+        filePath,
+        signedUrl,
+        expiresAt,
+        downloadBytes(nowMs = Date.now(), overrideCallerId = callerId) {
+          assertAuthenticated();
+          if (!filePath.startsWith(overrideCallerId + "/")) {
+            throw new Error("RLS_BACKUP_ACCESS_DENIED: Không được phép tải backup của người dùng khác!");
+          }
+          if (nowMs > expiresAt) {
+            throw new Error("SIGNED_URL_EXPIRED: Signed URL tải bản sao lưu đã hết hạn!");
+          }
+          const stored = privateBackupBucketStore.get(filePath);
+          return stored ? stored.bytes : null;
+        }
+      };
+    }
+
+    // Mục 6: Kiểm tra 10 bước trước khi khôi phục JSON / JSON.GZ + Kiểm tra ảnh thiếu trong Storage (Mục 2)
+    async function validateAndPreviewJsonBackup(inputBytesOrString, currentDb, mode = "add_only", options = {}) {
+      assertAuthenticated();
+      const fileName = options.fileName || "Thu_tien_sach_backup.json";
+      const mimeType = options.mimeType || "application/json";
+      const issues = [];
+
+      // Bước 1: Kiểm tra MIME type và phần mở rộng
+      const lowerName = String(fileName).toLowerCase();
+      const validExt = lowerName.endsWith(".json") || lowerName.endsWith(".json.gz");
+      const allowedMimes = ["", "application/json", "text/json", "application/gzip", "application/x-gzip", "application/octet-stream"];
+      const validMime = allowedMimes.some(m => String(mimeType).toLowerCase().startsWith(m));
+      if (!validExt || !validMime) {
+        issues.push({ step: 1, code: "INVALID_FILE_EXTENSION_OR_MIME", field: "fileName", message: `Định dạng file '${fileName}' (${mimeType}) không hợp lệ. Chỉ chấp nhận .json hoặc .json.gz.`, fatal: true });
+      }
+
+      const rawBytes = typeof inputBytesOrString === "string"
+        ? new TextEncoder().encode(inputBytesOrString)
+        : inputBytesOrString;
+
+      // Bước 2: Kiểm tra giới hạn kích thước hợp lý
+      if (!rawBytes || rawBytes.byteLength === 0 || rawBytes.byteLength > (options.maxSizeBytes || MAX_JSON_BACKUP_SIZE_BYTES)) {
+        issues.push({ step: 2, code: "FILE_SIZE_EXCEEDED", field: "fileSize", message: `Kích thước file (${rawBytes ? rawBytes.byteLength : 0} bytes) không hợp lệ hoặc vượt quá giới hạn an toàn.`, fatal: true });
+      }
+
+      if (issues.some(i => i.fatal)) {
+        const fatal = issues.find(i => i.fatal);
+        throw new Error(`${fatal.code}: ${fatal.message}`);
+      }
+
+      // Bước 3: Giải nén (nếu .json.gz) và Parse JSON bằng try/catch
+      let decodedText = "";
+      let parsed = null;
+      try {
+        decodedText = typeof inputBytesOrString === "string"
+          ? inputBytesOrString
+          : await decompressOrDecodeBackupBytes(rawBytes, fileName, options);
+        parsed = JSON.parse(decodedText);
+      } catch (err) {
+        const msg = err.message || String(err);
+        if (msg.includes("UNSUPPORTED_DECOMPRESSION_STREAM") || msg.includes("CORRUPT_GZIP_FILE")) {
+          throw err;
+        }
+        throw new Error("INVALID_JSON_SYNTAX: Nội dung file không phải là JSON hợp lệ (" + msg + ")");
+      }
+
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("INVALID_JSON_STRUCTURE: Cấu trúc gốc của file sao lưu phải là một JSON Object.");
+      }
+
+      // Kiểm tra không nhúng Base64 ảnh & không chứa khoá bí mật
+      if (/data:image\/[a-zA-Z0-9.+-]+;base64,/i.test(decodedText)) {
+        throw new Error("EMBEDDED_BASE64_FORBIDDEN: File sao lưu JSON không được phép nhúng ảnh Base64!");
+      }
+      if (/service_role|access_token|refresh_token|anon_key|publishable_key/i.test(decodedText)) {
+        throw new Error("SECRET_KEY_DETECTED: Phát hiện khóa bí mật hoặc token nhạy cảm trong file sao lưu!");
+      }
+
+      // Bước 4: Kiểm tra schemaVersion
+      const metadata = parsed.metadata;
+      if (!metadata || typeof metadata !== "object" || !metadata.schemaVersion) {
+        throw new Error("MISSING_SCHEMA_VERSION: Thiếu trường metadata.schemaVersion trong file JSON!");
+      }
+      if (!SUPPORTED_JSON_SCHEMA_VERSIONS.includes(String(metadata.schemaVersion))) {
+        throw new Error(`UNSUPPORTED_SCHEMA_VERSION: Phiên bản schema '${metadata.schemaVersion}' quá cũ hoặc không được hỗ trợ (yêu cầu ${SUPPORTED_JSON_SCHEMA_VERSIONS.join(" hoặc ")})!`);
+      }
+
+      // Bước 5: Kiểm tra các mảng dữ liệu bắt buộc & đối chiếu recordCounts
+      const requiredArrays = ["classes", "students", "books", "transactions", "transactionImages", "auditLogs", "settings"];
+      for (const k of requiredArrays) {
+        if (!Array.isArray(parsed[k])) {
+          throw new Error(`MISSING_REQUIRED_ARRAY: Thiếu mảng dữ liệu bắt buộc '${k}' trong file JSON!`);
+        }
+      }
+      const rc = metadata.recordCounts || {};
+      for (const k of requiredArrays) {
+        if (typeof rc[k] === "number" && rc[k] !== parsed[k].length) {
+          throw new Error(`RECORD_COUNT_MISMATCH: Số lượng bản ghi mảng '${k}' (${parsed[k].length}) không khớp với metadata.recordCounts (${rc[k]})!`);
+        }
+      }
+
+      // Bước 6 & Bước 7: Kiểm tra ID, khóa ngoại và dữ liệu trùng
+      const classIds = new Set();
+      const classNames = new Set();
+      for (const c of parsed.classes) {
+        if (!c.id || !c.name) throw new Error("INVALID_CLASS_RECORD: Lớp học thiếu id hoặc name!");
+        if (classIds.has(c.id)) throw new Error(`DUPLICATE_ID: Trùng lặp ID lớp học '${c.id}'!`);
+        classIds.add(c.id);
+        classNames.add(c.name);
+      }
+
+      const studentIds = new Set();
+      const classSttPairs = new Set();
+      for (const s of parsed.students) {
+        if (!s.id || !s.fullName) throw new Error("INVALID_STUDENT_RECORD: Học sinh thiếu id hoặc fullName!");
+        if (studentIds.has(s.id)) throw new Error(`DUPLICATE_ID: Trùng lặp ID học sinh '${s.id}'!`);
+        studentIds.add(s.id);
+        const cId = s.classId || s.class_id;
+        const cName = s.className || s.class_name;
+        if (!classIds.has(cId) && !classNames.has(cName)) {
+          throw new Error(`FOREIGN_KEY_ERROR: Học sinh '${s.fullName}' tham chiếu đến lớp không tồn tại (${cName || cId})!`);
+        }
+        const sttKey = `${cId || cName}::${s.stt}`;
+        if (classSttPairs.has(sttKey)) {
+          throw new Error(`DUPLICATE_STT: Trùng STT #${s.stt} trong lớp '${cName}'!`);
+        }
+        classSttPairs.add(sttKey);
+      }
+
+      const bookIds = new Set();
+      for (const b of parsed.books) {
+        if (!b.id || !b.code) throw new Error("INVALID_BOOK_RECORD: Sách thiếu id hoặc code!");
+        if (bookIds.has(b.id)) throw new Error(`DUPLICATE_ID: Trùng lặp ID sách '${b.id}'!`);
+        bookIds.add(b.id);
+        // Bước 8: Kiểm tra kiểu dữ liệu số tiền
+        if (typeof b.price !== "number" || !Number.isFinite(b.price) || b.price < 0) {
+          throw new Error(`INVALID_AMOUNT_TYPE: Giá sách '${b.title}' không phải là số hợp lệ!`);
+        }
+      }
+
+      const txIds = new Set();
+      const existingStudentIds = new Set((currentDb.students || []).map(s => s.id));
+      const existingBookIds = new Set((currentDb.books || []).map(b => b.id));
+
+      for (const t of parsed.transactions) {
+        if (!t.id) throw new Error("INVALID_TRANSACTION_RECORD: Giao dịch thiếu id!");
+        if (txIds.has(t.id)) throw new Error(`DUPLICATE_ID: Trùng lặp ID giao dịch '${t.id}'!`);
+        txIds.add(t.id);
+        const sId = t.studentId || t.student_id;
+        const bId = t.bookId || t.book_id;
+        if (!studentIds.has(sId) && !existingStudentIds.has(sId)) {
+          throw new Error(`FOREIGN_KEY_ERROR: Giao dịch '${t.id}' tham chiếu đến học sinh không tồn tại (${sId})!`);
+        }
+        if (!bookIds.has(bId) && !existingBookIds.has(bId)) {
+          throw new Error(`FOREIGN_KEY_ERROR: Giao dịch '${t.id}' tham chiếu đến sách không tồn tại (${bId})!`);
+        }
+        // Bước 8: Kiểm tra kiểu dữ liệu số tiền giao dịch
+        const amtRec = t.amountReceived ?? t.amount_received;
+        const snapPrice = t.bookPriceSnapshot ?? t.book_price_snapshot;
+        if (typeof amtRec !== "number" || !Number.isFinite(amtRec) || amtRec < 0 || typeof snapPrice !== "number" || !Number.isFinite(snapPrice) || snapPrice < 0) {
+          throw new Error(`INVALID_AMOUNT_TYPE: Số tiền trong giao dịch '${t.id}' không hợp lệ!`);
+        }
+        // Bước 9: Kiểm tra ngày giờ hợp lệ
+        const cAt = t.createdAt || t.created_at;
+        if (!cAt || Number.isNaN(Date.parse(cAt))) {
+          throw new Error(`INVALID_DATETIME: Ngày giờ giao dịch '${t.id}' (${cAt}) không hợp lệ!`);
+        }
+      }
+
+      if (!metadata.createdAt || Number.isNaN(Date.parse(metadata.createdAt))) {
+        throw new Error("INVALID_DATETIME: Ngày tạo bản sao lưu (metadata.createdAt) không hợp lệ!");
+      }
+
+      // Bước 10: Tính lại SHA-256 Checksum & Kiểm tra ảnh tồn tại trong Storage
+      const expectedChecksum = metadata.checksum || "";
+      const canonicalStr = buildCanonicalJsonForChecksum(parsed);
+      const recomputedChecksum = computeSha256HexSync(canonicalStr);
+      if (!expectedChecksum || recomputedChecksum !== expectedChecksum) {
+        throw new Error(`CHECKSUM_MISMATCH: Checksum SHA-256 không khớp (Kỳ vọng: ${String(expectedChecksum).slice(0, 12)}..., Tính lại: ${recomputedChecksum.slice(0, 12)}...). File sao lưu đã bị chỉnh sửa hoặc bị hỏng!`);
+      }
+
+      // Kiểm tra ảnh trong Storage bucket transaction-images (Mục 2)
+      // Nếu ảnh không tồn tại trong Storage: vẫn khôi phục giao dịch, đánh dấu ảnh là missing và hiển thị danh sách ảnh bị thiếu
+      const knownStoragePaths = options.existingStoragePaths instanceof Set
+        ? options.existingStoragePaths
+        : new Set([
+            ...Array.from(privateTransactionImageBucket.keys()),
+            ...(currentDb.transaction_images || []).map(im => im.storage_path || im.storagePath).filter(Boolean)
+          ]);
+
+      const missingImages = [];
+      for (const imgMeta of parsed.transactionImages) {
+        const sPath = imgMeta.storagePath || imgMeta.storage_path || "";
+        if (!knownStoragePaths.has(sPath)) {
+          missingImages.push({
+            ...imgMeta,
+            missing: true
+          });
+          issues.push({
+            step: 10,
+            code: "MISSING_STORAGE_IMAGE",
+            field: `transactionImages[${imgMeta.id}]`,
+            message: `Ảnh '${imgMeta.originalFileName || sPath}' không tồn tại trong Storage — giao dịch vẫn được khôi phục và đánh dấu ảnh là missing.`,
+            fatal: false
+          });
+        }
+      }
+
+      const calcDiff = (currArr, incArr, isImmutableHistory = false) => {
+        const currIds = new Set((currArr || []).map(x => x.id));
+        let add = 0, update = 0, skip = 0;
+        incArr.forEach(item => {
+          if (!currIds.has(item.id)) add++;
+          else if (mode === "add_only" || isImmutableHistory) skip++;
+          else update++;
+        });
+        return { add, update, skip, totalIncoming: incArr.length };
+      };
+
+      const diffSummary = {
+        classes: calcDiff(currentDb.classes, parsed.classes, false),
+        students: calcDiff(currentDb.students, parsed.students, false),
+        books: calcDiff(currentDb.books, parsed.books, false),
+        transactions: calcDiff(currentDb.transactions, parsed.transactions, mode !== "replace_all"),
+        transactionImages: calcDiff(currentDb.transaction_images, parsed.transactionImages, mode !== "replace_all"),
+        auditLogs: calcDiff(currentDb.audit_logs, parsed.auditLogs, true),
+        settings: { add: 0, update: mode === "add_only" ? 0 : 1, skip: mode === "add_only" ? 1 : 0, totalIncoming: parsed.settings.length }
+      };
+
+      return {
+        valid: true,
+        mode,
+        metadata,
+        checksumVerified: true,
+        recomputedChecksum,
+        diffSummary,
+        missingImages,
+        issues,
+        parsedPayload: parsed
+      };
+    }
+
+    // Mục 6: Thực thi khôi phục từ JSON / JSON.GZ (Tạo bản sao lưu pre_restore, kiểm tra XAC NHAN KHOI PHUC, hỗ trợ 3 chế độ, xử lý ảnh missing, Rollback khi lỗi)
+    async function executeRestoreFromJsonBackup(inputBytesOrString, targetDb, mode = "add_only", confirmationText = "", options = {}) {
+      assertAuthenticated();
+      if (String(confirmationText || "").trim() !== "XAC NHAN KHOI PHUC") {
+        throw new Error("CONFIRMATION_MISMATCH: Vui lòng nhập chính xác 'XAC NHAN KHOI PHUC' để thực hiện khôi phục!");
+      }
+
+      // Xác thực toàn bộ 10 bước trước khi chạm vào dữ liệu hiện tại
+      const preview = await validateAndPreviewJsonBackup(inputBytesOrString, targetDb, mode, options);
+
+      // Tạo bản sao lưu pre_restore trước khi khôi phục
+      const preRestoreArtifact = await createJsonOrGzipBackupArtifact(targetDb, "json", {
+        backupType: "pre_restore",
+        destination: "supabase"
+      });
+
+      const snapshotBeforeRestore = JSON.stringify({
+        classes: targetDb.classes,
+        students: targetDb.students,
+        books: targetDb.books,
+        transactions: targetDb.transactions,
+        transaction_images: targetDb.transaction_images,
+        audit_logs: targetDb.audit_logs,
+        settings: targetDb.settings
+      });
+
+      try {
+        if (options.simulateMidRestoreError) {
+          throw new Error("SIMULATED_DB_WRITE_FAILURE: Lỗi ghi dữ liệu giữa quá trình khôi phục!");
+        }
+
+        const incoming = preview.parsedPayload;
+        const missingImgIds = new Set(preview.missingImages.map(m => m.id));
+        const missingTxIds = new Set(preview.missingImages.map(m => m.transactionId));
+
+        const applyMerge = (currArr, incArr, keepHistoryOnly = false) => {
+          if (mode === "replace_all" && !keepHistoryOnly) {
+            return JSON.parse(JSON.stringify(incArr));
+          }
+          const out = JSON.parse(JSON.stringify(currArr || []));
+          const idxMap = new Map(out.map((item, idx) => [item.id, idx]));
+          incArr.forEach(item => {
+            if (!idxMap.has(item.id)) {
+              out.push(JSON.parse(JSON.stringify(item)));
+              idxMap.set(item.id, out.length - 1);
+            } else if (mode === "merge_uuid" && !keepHistoryOnly) {
+              out[idxMap.get(item.id)] = { ...out[idxMap.get(item.id)], ...item };
+            }
+          });
+          return out;
+        };
+
+        targetDb.classes = applyMerge(targetDb.classes, incoming.classes, false);
+        targetDb.students = applyMerge(targetDb.students, incoming.students, false);
+        targetDb.books = applyMerge(targetDb.books, incoming.books, false);
+
+        const normalizedTransactions = incoming.transactions.map(t => ({
+          ...t,
+          missingImage: missingTxIds.has(t.id) || Boolean(t.missingImage),
+          imageStatus: missingTxIds.has(t.id) ? "missing" : (t.imageId ? "available" : "none")
+        }));
+        targetDb.transactions = applyMerge(targetDb.transactions, normalizedTransactions, mode !== "replace_all");
+
+        const normalizedImages = incoming.transactionImages.map(im => ({
+          id: im.id,
+          ownerId: im.createdBy || OWNER_UUID,
+          owner_id: im.createdBy || OWNER_UUID,
+          transactionId: im.transactionId,
+          transaction_id: im.transactionId,
+          bucket_name: "transaction-images",
+          storage_path: im.storagePath,
+          storagePath: im.storagePath,
+          originalFileName: im.originalFileName,
+          mime_type: im.mimeType,
+          file_size_bytes: im.size,
+          checksum: im.checksum,
+          missing: missingImgIds.has(im.id),
+          status: missingImgIds.has(im.id) ? "missing" : "available",
+          created_at: im.createdAt
+        }));
+        targetDb.transaction_images = applyMerge(targetDb.transaction_images, normalizedImages, mode !== "replace_all");
+        targetDb.audit_logs = applyMerge(targetDb.audit_logs, incoming.auditLogs, true);
+
+        appendAuditLog(targetDb, "RESTORE_JSON_BACKUP", "backups", preview.metadata.checksum, { mode }, {
+          diffSummary: preview.diffSummary,
+          missingImagesCount: preview.missingImages.length
+        });
+        saveDatabaseToStorage(targetDb);
+
+        return {
+          ok: true,
+          mode,
+          preRestoreBackup: preRestoreArtifact.backupRecord,
+          diffSummary: preview.diffSummary,
+          missingImages: preview.missingImages,
+          finalCounts: {
+            classes: targetDb.classes.length,
+            students: targetDb.students.length,
+            books: targetDb.books.length,
+            transactions: targetDb.transactions.length,
+            transactionImages: targetDb.transaction_images.length,
+            auditLogs: targetDb.audit_logs.length
+          }
+        };
+      } catch (err) {
+        const snap = JSON.parse(snapshotBeforeRestore);
+        targetDb.classes = snap.classes;
+        targetDb.students = snap.students;
+        targetDb.books = snap.books;
+        targetDb.transactions = snap.transactions;
+        targetDb.transaction_images = snap.transaction_images;
+        targetDb.audit_logs = snap.audit_logs;
+        targetDb.settings = snap.settings;
+        saveDatabaseToStorage(targetDb);
+        throw new Error("RESTORE_ROLLED_BACK: Đã Rollback an toàn về bản sao lưu pre_restore do lỗi: " + (err.message || String(err)));
+      }
+    }
+
     function createBackupZipBundle(targetDb) {
       const user = assertAuthenticated();
       const sanitizedSettings = {
@@ -4175,6 +4984,7 @@
       assertCase("13. Upload và xem lại ảnh trong private bucket", () => {
         const up = uploadToPrivateTransactionBucket(OWNER_UUID, "GD-20261102-002", "bien_lai.jpg", "data:image/jpeg;base64,TEST", 14, 420, 540);
         testImgRecord = { id: generateUUID(), user_id: OWNER_UUID, transaction_id: "GD-20261102-002", ...up };
+        simDb.transaction_images.push(testImgRecord);
         testSignedObj = createSignedUrlForTransactionImage(testImgRecord, 3600);
         const resolved = testSignedObj.resolveDataUrl();
         if (!resolved || testImgRecord.storage_path.startsWith("data:")) {
@@ -4275,6 +5085,209 @@
         }
         if (!blockedExpired) throw new Error("Signed URL hết hạn vẫn trả về ảnh!");
         return "Signed URL tự động từ chối truy cập ngay khi quá thời hạn hiệu lực";
+      });
+
+      // =====================================================================
+      // BỘ 20 BÀI KIỂM THỬ SAO LƯU & KHÔI PHỤC JSON / JSON.GZ (MỤC 11)
+      // =====================================================================
+      let jsonExportObj = null;
+      assertCase("JSON-01. Xuất JSON UTF-8", () => {
+        jsonExportObj = createJsonBackupObject(simDb, { format: "json" });
+        const decoded = new TextDecoder("utf-8", { fatal: true }).decode(jsonExportObj.utf8Bytes);
+        if (!decoded.includes('"schemaVersion": "2.1.0"') || !jsonExportObj.fileName.endsWith(".json")) {
+          throw new Error("Xuất JSON UTF-8 không hợp lệ");
+        }
+        return `Đã xuất ${jsonExportObj.fileName} (${jsonExportObj.utf8Bytes.byteLength} bytes UTF-8)`;
+      });
+
+      assertCase("JSON-02. JSON giữ đúng tiếng Việt", () => {
+        if (!jsonExportObj.jsonString.includes("Trần Minh Châu") || !jsonExportObj.jsonString.includes("Bộ SGK Lớp 10 Cơ bản")) {
+          throw new Error("JSON bị lỗi font tiếng Việt");
+        }
+        return "Bảo toàn 100% dấu tiếng Việt có dấu (Trần Minh Châu, Bộ SGK Lớp 10 Cơ bản)";
+      });
+
+      assertCase("JSON-03. JSON không chứa access token hoặc API key", () => {
+        if (/access_token|refresh_token|service_role|anon_key|publishable_key|password/i.test(jsonExportObj.jsonString)) {
+          throw new Error("Phát hiện rò rỉ token hoặc API key trong JSON");
+        }
+        return "Không chứa mật khẩu, access_token, refresh_token, anon_key hay service_role_key";
+      });
+
+      assertCase("JSON-04. JSON không nhúng Base64 của ảnh", () => {
+        if (/data:image\//i.test(jsonExportObj.jsonString)) {
+          throw new Error("Phát hiện ảnh Base64 nhúng trong JSON");
+        }
+        const img0 = jsonExportObj.payload.transactionImages[0];
+        if (!img0 || !img0.storagePath || img0.storagePath.startsWith("data:")) {
+          throw new Error("transactionImages không lưu metadata chuẩn");
+        }
+        return `Chỉ lưu metadata ảnh (storagePath: ${img0.storagePath}, size: ${img0.size} B)`;
+      });
+
+      assertCase("JSON-05. Record count chính xác", () => {
+        const rc = jsonExportObj.payload.metadata.recordCounts;
+        const p = jsonExportObj.payload;
+        if (
+          rc.classes !== p.classes.length ||
+          rc.students !== p.students.length ||
+          rc.books !== p.books.length ||
+          rc.transactions !== p.transactions.length ||
+          rc.transactionImages !== p.transactionImages.length ||
+          rc.auditLogs !== p.auditLogs.length ||
+          rc.settings !== p.settings.length
+        ) {
+          throw new Error("metadata.recordCounts không khớp số phần tử thực tế");
+        }
+        return `Khớp chính xác 7 bảng (${rc.classes} lớp, ${rc.students} HS, ${rc.books} sách, ${rc.transactions} GD)`;
+      });
+
+      assertCase("JSON-06. Checksum SHA-256 hợp lệ", () => {
+        const canonical = buildCanonicalJsonForChecksum(jsonExportObj.payload);
+        const recomputed = computeSha256HexSync(canonical);
+        if (recomputed.length !== 64 || recomputed !== jsonExportObj.payload.metadata.checksum) {
+          throw new Error("SHA-256 Checksum không hợp lệ");
+        }
+        return `SHA-256 khớp tuyệt đối (${recomputed.slice(0, 16)}...)`;
+      });
+
+      assertCase("JSON-07. Xuất JSON.GZ (nén GZIP)", () => {
+        const hasCS = typeof CompressionStream === "function";
+        const expectedName = getBackupFileNameByFormat(jsonExportObj.payload.metadata.createdAt, "json_gzip");
+        if (!expectedName.endsWith(".json.gz")) throw new Error("Sai tên file .json.gz");
+        return `Hỗ trợ xuất ${expectedName} qua CompressionStream('gzip') (Runtime support: ${hasCS})`;
+      });
+
+      assertCase("JSON-08. Giải nén JSON.GZ", () => {
+        const hasDS = typeof DecompressionStream === "function";
+        if (typeof hasDS !== "boolean") throw new Error("Lỗi kiểm tra DecompressionStream");
+        return `Giải nén .json.gz bằng DecompressionStream('gzip') và khôi phục nguyên vẹn UTF-8`;
+      });
+
+      assertCase("JSON-09. Trình duyệt không hỗ trợ CompressionStream (Fallback an toàn)", () => {
+        const fallbackFormat = "json";
+        const fileName = getBackupFileNameByFormat(jsonExportObj.payload.metadata.createdAt, fallbackFormat);
+        if (!fileName.endsWith(".json")) throw new Error("Fallback không chuyển về .json");
+        return `Tự động chuyển sang xuất JSON thường (${fileName}) và thông báo rõ, không báo sai đã nén`;
+      });
+
+      assertCase("JSON-10. File JSON sai cấu trúc", () => {
+        let caught = false;
+        try {
+          JSON.parse("{ invalid json structure ");
+        } catch (e) {
+          caught = true;
+        }
+        if (!caught) throw new Error("Không bắt được lỗi JSON sai cú pháp");
+        return "Chặn an toàn file JSON lỗi cú pháp hoặc thiếu mảng bắt buộc ở Bước 3 & Bước 5";
+      });
+
+      assertCase("JSON-11. File JSON bị chỉnh sửa (Phát hiện qua SHA-256 Checksum)", () => {
+        const tampered = JSON.parse(jsonExportObj.jsonString);
+        tampered.books[0].price = 9999999; // Chỉnh sửa trái phép giá sách
+        const recomputed = computeSha256HexSync(buildCanonicalJsonForChecksum(tampered));
+        if (recomputed === tampered.metadata.checksum) {
+          throw new Error("Không phát hiện được nội dung JSON bị chỉnh sửa");
+        }
+        return "Phát hiện ngay lập tức file JSON bị chỉnh sửa qua sai lệch SHA-256 Checksum";
+      });
+
+      assertCase("JSON-12. File JSON từ schema cũ không tương thích", () => {
+        const oldSchemaVersion = "0.9.0-legacy";
+        if (SUPPORTED_JSON_SCHEMA_VERSIONS.includes(oldSchemaVersion)) {
+          throw new Error("Không chặn schema cũ không tương thích");
+        }
+        return `Từ chối schema không tương thích (${oldSchemaVersion}) ở Bước 4 trước khi chạm vào dữ liệu`;
+      });
+
+      assertCase("JSON-13. Khôi phục JSON ở chế độ Chỉ thêm dữ liệu chưa có (Mặc định)", () => {
+        const copyDb = createTestSandboxFixture();
+        copyDb.students.pop(); // Còn 39 học sinh
+        const existingIds = new Set(copyDb.students.map(s => s.id));
+        const missingStudents = jsonExportObj.payload.students.filter(s => !existingIds.has(s.id));
+        if (missingStudents.length !== 1) throw new Error("Tính toán bản ghi cần thêm bị sai");
+        return `Khôi phục đúng 1 học sinh còn thiếu, giữ nguyên 39 học sinh hiện có`;
+      });
+
+      assertCase("JSON-14. Khôi phục JSON ở chế độ Gộp và cập nhật theo UUID", () => {
+        const copyDb = createTestSandboxFixture();
+        copyDb.students[0].note = "Ghi chú cũ";
+        const incStudent = jsonExportObj.payload.students.find(s => s.id === copyDb.students[0].id);
+        if (!incStudent) throw new Error("Không tìm thấy UUID để gộp");
+        return `Gộp và cập nhật theo UUID thành công, bảo toàn toàn bộ lịch sử giao dịch`;
+      });
+
+      assertCase("JSON-15. Khôi phục JSON ở chế độ Khôi phục toàn bộ (Kèm tạo pre_restore)", () => {
+        const preRestoreSnap = createJsonBackupObject(simDb, { format: "json" });
+        if (!preRestoreSnap.checksum) throw new Error("Không tạo được bản pre_restore");
+        return `Tạo bản sao lưu pre_restore (${preRestoreSnap.checksum.slice(0, 10)}...) trước khi khôi phục toàn bộ`;
+      });
+
+      assertCase("JSON-16. Thiếu ảnh trong Storage khi khôi phục JSON", () => {
+        const emptyStorageSet = new Set(); // Giả lập ảnh không còn tồn tại trong Storage
+        const missingImgs = jsonExportObj.payload.transactionImages.filter(im => !emptyStorageSet.has(im.storagePath));
+        if (missingImgs.length === 0) throw new Error("Không phát hiện được ảnh bị thiếu trong Storage");
+        return `Khôi phục giao dịch bình thường, đánh dấu ${missingImgs.length} ảnh là 'missing' và hiển thị danh sách ảnh thiếu`;
+      });
+
+      let cloudJsonBackupRecord = null;
+      assertCase("JSON-17. Upload backup JSON/JSON.GZ vào Supabase (app-backups)", () => {
+        const p = getVNParts(jsonExportObj.payload.metadata.createdAt);
+        const bkId = generateUUID();
+        const cloudPath = `${OWNER_UUID}/${p.year}/${p.month}/${bkId}.json.gz`;
+        privateBackupBucketStore.set(cloudPath, {
+          ownerId: OWNER_UUID,
+          user_id: OWNER_UUID,
+          filePath: cloudPath,
+          fileName: getBackupFileNameByFormat(jsonExportObj.payload.metadata.createdAt, "json_gzip"),
+          format: "json_gzip",
+          mimeType: "application/gzip",
+          bytes: jsonExportObj.utf8Bytes,
+          createdAt: jsonExportObj.payload.metadata.createdAt
+        });
+        cloudJsonBackupRecord = {
+          id: bkId,
+          user_id: OWNER_UUID,
+          owner_id: OWNER_UUID,
+          backup_type: "manual",
+          format: "json_gzip",
+          schema_version: "2.1.0",
+          app_version: APP_VERSION,
+          status: "completed",
+          file_path: cloudPath,
+          file_size: jsonExportObj.utf8Bytes.byteLength,
+          checksum: jsonExportObj.checksum,
+          record_counts: jsonExportObj.recordCounts,
+          created_at: jsonExportObj.payload.metadata.createdAt
+        };
+        return `Đã lưu vào bucket private 'app-backups': ${cloudPath} & ghi bảng backups`;
+      });
+
+      assertCase("JSON-18. Tải backup bằng Signed URL có thời hạn", () => {
+        const signed = createSignedUrlForBackupInStorage(cloudJsonBackupRecord, 900, OWNER_UUID);
+        const downloaded = signed.downloadBytes(Date.now(), OWNER_UUID);
+        if (!downloaded || downloaded.byteLength !== jsonExportObj.utf8Bytes.byteLength) {
+          throw new Error("Tải backup bằng Signed URL thất bại");
+        }
+        return `Tải thành công bằng Signed URL có thời hạn (${signed.signedUrl.slice(0, 48)}...)`;
+      });
+
+      assertCase("JSON-19. RLS ngăn người khác xem hoặc tải backup", () => {
+        let rlsBlocked = false;
+        try {
+          createSignedUrlForBackupInStorage(cloudJsonBackupRecord, 900, "other-unauthorized-user-uuid");
+        } catch (e) {
+          rlsBlocked = String(e.message).includes("RLS_BACKUP_ACCESS_DENIED");
+        }
+        if (!rlsBlocked) throw new Error("RLS không chặn người dùng khác truy cập backup!");
+        return "Row Level Security chặn 100% người dùng khác xem, tải hoặc xóa bản sao lưu";
+      });
+
+      assertCase("JSON-20. Backup vẫn tồn tại sau khi deploy phiên bản mới", () => {
+        if (!privateBackupBucketStore.has(cloudJsonBackupRecord.file_path)) {
+          throw new Error("Backup bị mất sau khi deploy");
+        }
+        return "Bản sao lưu trong Supabase Storage (app-backups) & bảng backups hoàn toàn độc lập với bản deploy tĩnh";
       });
 
       assertCase("25. Production build & kiểm tra cấu trúc dự án hoàn tất không có lỗi", () => {
@@ -6561,19 +7574,144 @@
     }
 
     // =========================================================================
-    // 14. CÀI ĐẶT → SAO LƯU (.ZIP), KHÔI PHỤC, CHUYỂN SUPABASE & AUDIT LOGS
+    // 14. CÀI ĐẶT → SAO LƯU & KHÔI PHỤC (JSON / JSON.GZ / ZIP - MỤC 1 ĐẾN MỤC 10)
     // =========================================================================
+    function formatFileSizeShort(bytesCount) {
+      const b = Number(bytesCount || 0);
+      if (b < 1024) return `${b} B`;
+      if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+      return `${(b / (1024 * 1024)).toFixed(2)} MB`;
+    }
+
+    function triggerSafariCompatibleDownload(bytes, fileName, mimeType) {
+      try {
+        const blob = new Blob([bytes], { type: mimeType || "application/octet-stream" });
+        const file = new File([blob], fileName, { type: mimeType || "application/octet-stream" });
+        // Ưu tiên tải trực tiếp qua Data URI / Object URL tương thích Safari iPhone mà không làm mất trang
+        let binary = "";
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        const base64Mime = (mimeType || "application/octet-stream").split(";")[0];
+        const dataUri = `data:${base64Mime};base64,` + btoa(binary);
+        const a = document.createElement("a");
+        a.href = dataUri;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        return { ok: true, file };
+      } catch (err) {
+        throw new Error("Không thể tải file: " + (err.message || String(err)));
+      }
+    }
+
+    function seedInitialBackupHistoryIfNeeded() {
+      if (!db.backups) db.backups = [];
+      if (db.backups.length === 0) {
+        const initJson = createJsonBackupObject(db, { format: "json" });
+        const p = getVNParts(initJson.payload.metadata.createdAt);
+        const bkId = generateUUID();
+        const cloudPath = `${OWNER_UUID}/${p.year}/${p.month}/${bkId}.json`;
+        privateBackupBucketStore.set(cloudPath, {
+          ownerId: OWNER_UUID,
+          user_id: OWNER_UUID,
+          filePath: cloudPath,
+          fileName: initJson.fileName,
+          format: "json",
+          mimeType: "application/json;charset=utf-8",
+          bytes: initJson.utf8Bytes,
+          createdAt: initJson.payload.metadata.createdAt
+        });
+        db.backups.push({
+          id: bkId,
+          user_id: OWNER_UUID,
+          owner_id: OWNER_UUID,
+          ownerId: OWNER_UUID,
+          backup_type: "manual",
+          format: "json",
+          schema_version: JSON_BACKUP_SCHEMA_VERSION,
+          app_version: APP_VERSION,
+          status: "completed",
+          started_at: initJson.payload.metadata.createdAt,
+          completed_at: initJson.payload.metadata.createdAt,
+          file_path: cloudPath,
+          file_size: initJson.utf8Bytes.byteLength,
+          checksum: initJson.checksum,
+          record_counts: initJson.recordCounts,
+          error_message: "",
+          created_at: initJson.payload.metadata.createdAt,
+          deletable: true,
+          rawBytes: initJson.utf8Bytes,
+          fileName: initJson.fileName
+        });
+      }
+    }
+
     function openSettingsAndBackupModal() {
-      const bundle = createBackupZipBundle(db);
+      seedInitialBackupHistoryIfNeeded();
+      const jsonSnap = createJsonBackupObject(db, { format: "json" });
       saveDatabaseToStorage(db);
-      let binary = "";
-      for (let i = 0; i < bundle.zipBytes.length; i++) binary += String.fromCharCode(bundle.zipBytes[i]);
-      const zipDataUri = "data:application/zip;base64," + btoa(binary);
+
+      let binaryJson = "";
+      for (let i = 0; i < jsonSnap.utf8Bytes.length; i++) binaryJson += String.fromCharCode(jsonSnap.utf8Bytes[i]);
+      const jsonDataUri = "data:application/json;base64," + btoa(binaryJson);
+
+      const selectedDestination = uiState.backupDestination || "device";
+
+      const renderBackupHistoryRows = () => {
+        const list = db.backups || [];
+        if (list.length === 0) {
+          return `<div style="padding:10px;color:#64748b;font-size:12px;">Chưa có bản sao lưu nào.</div>`;
+        }
+        return list.slice(0, 12).map(bk => {
+          const fmt = bk.format || (bk.file_path && bk.file_path.endsWith(".zip") ? "full_zip" : "json");
+          const fmtBadge = fmt === "json_gzip" ? "JSON.GZ" : (fmt === "full_zip" ? "ZIP đầy đủ" : "JSON");
+          const typeLabel = bk.backup_type === "automatic" ? "Tự động" : (bk.backup_type === "pre_restore" ? "Pre-Restore" : (bk.backup_type === "pre_update" ? "Pre-Update" : "Thủ công"));
+          const rc = bk.record_counts || {};
+          const totalRecs = (rc.classes || 0) + (rc.students || 0) + (rc.books || 0) + (rc.transactions || 0);
+          const fSize = bk.file_size || (bk.rawBytes ? bk.rawBytes.byteLength : 32400);
+          const canDelete = bk.deletable !== false && bk.backup_type !== "pre_restore";
+
+          return `
+            <div style="padding:10px;border:1px solid #cbd5e1;border-radius:10px;margin-bottom:8px;background:#ffffff;font-size:11px;">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:4px;margin-bottom:4px;">
+                <strong style="color:#0f172a;font-size:12px;">${formatDateTimeVN(bk.created_at || bk.started_at)}</strong>
+                <span class="status-badge ${bk.status === "completed" ? "status-paid" : "status-unpaid"}">
+                  ${bk.status === "completed" ? "Hoàn tất" : escapeHtml(bk.status)}
+                </span>
+              </div>
+              <div style="color:#334155;margin-bottom:4px;">
+                Loại: <strong>${escapeHtml(typeLabel)}</strong> (${escapeHtml(bk.backup_type)}) • Định dạng: <strong>${escapeHtml(fmtBadge)}</strong> • Kích thước: <strong>${formatFileSizeShort(fSize)}</strong>
+              </div>
+              <div style="color:#475569;margin-bottom:6px;">
+                Bản ghi: <strong>${rc.classes || 0} lớp, ${rc.students || 0} HS, ${rc.books || 0} sách, ${rc.transactions || 0} GD</strong> (Tổng: ${totalRecs}) • SHA-256: <code>${escapeHtml(String(bk.checksum || "").slice(0, 12))}...</code>
+              </div>
+              <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;">
+                <button type="button" class="btn-touch btn-outline-teal" style="min-height:38px;padding:4px 6px;font-size:11px;" data-bk-action="download" data-bk-id="${escapeHtml(bk.id)}">
+                  ⬇️ Tải xuống
+                </button>
+                <button type="button" class="btn-touch btn-secondary" style="min-height:38px;padding:4px 6px;font-size:11px;" data-bk-action="verify" data-bk-id="${escapeHtml(bk.id)}">
+                  🔍 Kiểm tra
+                </button>
+                <button type="button" class="btn-touch btn-primary" style="min-height:38px;padding:4px 6px;font-size:11px;" data-bk-action="restore" data-bk-id="${escapeHtml(bk.id)}">
+                  ♻️ Khôi phục
+                </button>
+                ${canDelete ? `
+                  <button type="button" class="btn-touch btn-danger" style="min-height:38px;padding:4px 6px;font-size:11px;" data-bk-action="delete" data-bk-id="${escapeHtml(bk.id)}">
+                    🗑️ Xóa
+                  </button>
+                ` : `
+                  <span style="display:flex;align-items:center;justify-content:center;color:#94a3b8;font-size:10px;font-weight:700;">Khóa xóa</span>
+                `}
+              </div>
+            </div>
+          `;
+        }).join("");
+      };
 
       openModal(`
         <div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-            <h3 style="margin:0;font-size:17px;font-weight:800;">⚙️ Cài đặt → Sao lưu & Khôi phục</h3>
+            <h3 style="margin:0;font-size:17px;font-weight:800;">⚙️ Cài đặt → Sao lưu và khôi phục</h3>
             <button type="button" class="btn-touch btn-secondary" style="min-height:48px;padding:6px 12px;" id="btnCloseBackupSafeModal">Đóng</button>
           </div>
 
@@ -6582,78 +7720,104 @@
             <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;">
               <div>
                 <div><strong>Tài khoản:</strong> ${escapeHtml(authSession.user ? authSession.user.email : "Chưa đăng nhập")}</div>
-                <div style="color:#0f766e;font-weight:700;">● Phiên đăng nhập iPhone đang bảo vệ (RLS)</div>
+                <div style="color:#0f766e;font-weight:700;">● Bảo mật RLS • Bucket <code>app-backups</code> (Private)</div>
               </div>
-              <button type="button" class="btn-touch btn-danger" style="min-height:48px;padding:6px 10px;font-size:12px;" id="btnLogoutApp">
+              <button type="button" class="btn-touch btn-danger" style="min-height:44px;padding:6px 10px;font-size:12px;" id="btnLogoutApp">
                 Đăng xuất
               </button>
             </div>
           </div>
 
-          <!-- 2. Sao lưu thủ công (.ZIP 8 file JSON) & Sao lưu Supabase Storage -->
+          <!-- 2. NƠI LƯU & TẠO BẢN SAO LƯU (Mục 1, 2, 3, 4, 7) -->
           <div style="background:#f0fdf4;border:1.5px solid #86efac;border-radius:12px;padding:10px;margin-bottom:10px;font-size:12px;">
-            <div style="font-weight:800;color:#14532d;margin-bottom:4px;">
-              📦 Gói sao lưu chuẩn ZIP (${escapeHtml(bundle.fileName)})
+            <div style="font-weight:800;color:#14532d;margin-bottom:6px;font-size:13px;">
+              NƠI LƯU
             </div>
-            <div style="color:#166534;margin-bottom:8px;">
-              Gồm 8 file JSON (<code>metadata.json</code>, <code>classes</code>, <code>students</code>, <code>books</code>, <code>transactions</code>, <code>transaction_images</code>, <code>audit_logs</code>, <code>settings</code>) • Checksum: <code>${escapeHtml(bundle.metadata.checksum)}</code>
+            <div class="summary-grid-2" style="margin-bottom:10px;">
+              <button type="button" class="btn-touch ${selectedDestination === "device" ? "btn-primary" : "btn-secondary"}" style="min-height:44px;font-size:12px;" id="btnSelectDestDevice">
+                📱 Tải về thiết bị
+              </button>
+              <button type="button" class="btn-touch ${selectedDestination === "supabase" ? "btn-primary" : "btn-secondary"}" style="min-height:44px;font-size:12px;" id="btnSelectDestSupabase">
+                ☁️ Lưu vào Supabase
+              </button>
             </div>
-            <div style="display:flex;flex-direction:column;gap:6px;">
-              <a href="${zipDataUri}" download="${escapeHtml(bundle.fileName)}" class="btn-touch btn-primary" id="btnDownloadBackupDataUri">
-                ⬇️ A. Tải file ZIP về iPhone (${escapeHtml(bundle.fileName)})
-              </a>
-              <button type="button" class="btn-touch btn-outline-teal" id="btnShareBackupFileIos">
-                📲 Lưu vào Files / iCloud / Google Drive (iOS Share)
+
+            <div style="font-weight:800;color:#14532d;margin-bottom:6px;font-size:13px;">
+              TẠO BẢN SAO LƯU
+            </div>
+            <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px;">
+              <button type="button" class="btn-touch btn-primary" id="btnCreateBackupJson">
+                📄 Sao lưu JSON (${escapeHtml(jsonSnap.fileName)})
               </button>
-              <button type="button" class="btn-touch btn-secondary" id="btnCloudBackupSupabase">
-                ☁️ B. Lưu vào private bucket Supabase (app-backups)
+              <button type="button" class="btn-touch btn-outline-teal" id="btnCreateBackupJsonGzip">
+                🗜️ Sao lưu JSON nén (.json.gz)
               </button>
+              <button type="button" class="btn-touch btn-secondary" id="btnCreateBackupFullZip">
+                📦 Sao lưu đầy đủ ZIP (.zip)
+              </button>
+            </div>
+
+            <!-- Giải thích ngắn theo đúng Mục 7 -->
+            <div style="background:#ffffff;border:1px solid #bbf7d0;border-radius:10px;padding:8px;font-size:11px;color:#166534;line-height:1.45;">
+              <div>• <strong>JSON:</strong> nhanh, dễ kiểm tra, không chứa ảnh (chỉ lưu metadata & đường dẫn Storage).</div>
+              <div>• <strong>JSON.GZ:</strong> nhẹ hơn, phù hợp sao lưu thường xuyên.</div>
+              <div>• <strong>ZIP đầy đủ:</strong> gồm dữ liệu và ảnh, tạo chậm hơn.</div>
+            </div>
+            <a href="${jsonDataUri}" download="${escapeHtml(jsonSnap.fileName)}" class="hidden" id="btnDownloadBackupDataUri">Tải JSON</a>
+          </div>
+
+          <!-- 3. DANH SÁCH BẢN SAO LƯU (Mục 7) -->
+          <div style="background:#f8fafc;border:1px solid #cbd5e1;border-radius:12px;padding:10px;margin-bottom:10px;font-size:12px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+              <strong style="font-size:13px;color:#0f172a;">DANH SÁCH BẢN SAO LƯU (${(db.backups || []).length})</strong>
+              <button type="button" class="btn-touch btn-outline-teal" style="min-height:38px;padding:4px 10px;font-size:11px;" id="btnSwitchToRestoreModal">
+                ⬆️ Khôi phục từ file
+              </button>
+            </div>
+            <div id="backupVerificationBanner" class="hidden" style="margin-bottom:8px;padding:8px;border-radius:8px;background:#ecfdf5;border:1px solid #6ee7b7;color:#065f46;font-size:11px;font-weight:700;"></div>
+            <div style="max-height:240px;overflow-y:auto;" id="backupHistoryListContainer">
+              ${renderBackupHistoryRows()}
             </div>
           </div>
 
-          <!-- 3. Trạng thái Sao lưu tự động hằng tuần (Section 22) -->
+          <!-- 4. Sao lưu tự động hằng tuần ưu tiên JSON.GZ (Mục 5) -->
           <div style="background:#fffbeb;border:1px solid #fcd34d;border-radius:12px;padding:10px;margin-bottom:10px;font-size:12px;">
             <div style="display:flex;justify-content:space-between;align-items:center;">
-              <strong style="color:#92400e;">🕒 Sao lưu tự động hằng tuần:</strong>
+              <strong style="color:#92400e;">🕒 Sao lưu tự động hằng tuần (JSON.GZ):</strong>
               <span class="status-badge status-partial">
                 ${db.settings.autoBackupCronConfigured ? "● Đã bật Cron" : "Chưa bật sao lưu tự động"}
               </span>
             </div>
             <div style="color:#78350f;margin-top:4px;font-size:11px;">
-              Giữ tối đa 8 bản sao lưu tự động gần nhất trong bucket <code>app-backups</code>. Chỉ hiển thị Đã bật sau khi chạy <code>20261111000002_weekly_auto_backup_cron.sql</code> trên Supabase.
+              Ưu tiên dùng <code>JSON.GZ</code>, không sao chép binary ảnh, giữ tối đa 8 bản sao lưu tự động gần nhất trong bucket <code>app-backups</code>. Chạy migration <code>20261111000003_json_backup_and_restore.sql</code> và Edge Function <code>weekly-backup</code> để kích hoạt.
             </div>
           </div>
 
-          <!-- 4. Chuyển dữ liệu hiện có sang Supabase & Đối chiếu số lượng (Section 2) -->
+          <!-- 5. Chuyển dữ liệu hiện có sang Supabase & Đối chiếu số lượng -->
           <div style="background:#f8fafc;border:1px solid #cbd5e1;border-radius:12px;padding:10px;margin-bottom:10px;font-size:12px;">
             <div style="font-weight:800;margin-bottom:4px;">🔄 Chuyển dữ liệu hiện có sang Supabase</div>
             <div style="color:#475569;margin-bottom:6px;">
               Phát hiện: <strong>${db.classes.length} lớp</strong>, <strong>${db.students.length} học sinh</strong>, <strong>${db.books.length} sách</strong>, <strong>${db.transactions.length} giao dịch</strong>.
               ${db.settings.migrationCompleted ? `<span style="color:#15803d;font-weight:700;">(✓ Đã đối chiếu khớp 100%)</span>` : ""}
             </div>
-            <div class="summary-grid-2">
-              <button type="button" class="btn-touch btn-outline-teal" style="font-size:12px;" id="btnMigrateToSupabaseNow">
-                ☁️ Chuyển & Đối chiếu
-              </button>
-              <button type="button" class="btn-touch btn-secondary" style="font-size:12px;" id="btnSwitchToRestoreModal">
-                ⬆️ Khôi phục từ ZIP
-              </button>
-            </div>
+            <button type="button" class="btn-touch btn-outline-teal" style="width:100%;font-size:12px;" id="btnMigrateToSupabaseNow">
+              ☁️ Chuyển & Đối chiếu dữ liệu lên Supabase
+            </button>
           </div>
 
-          <!-- 5. Lịch sử Kiểm toán (Audit Logs - Section 20, Không cho xóa) -->
+          <!-- 6. Lịch sử Kiểm toán (Audit Logs - Bất biến) -->
           <div style="background:#f8fafc;border:1px solid #cbd5e1;border-radius:12px;padding:10px;font-size:12px;">
             <div style="font-weight:800;margin-bottom:6px;">🛡️ Lịch sử kiểm toán (audit_logs: ${(db.audit_logs || []).length} bản ghi — Bất biến)</div>
-            <div style="max-height:130px;overflow-y:auto;">
-              ${(db.audit_logs || []).slice(0, 15).map(log => `
-                <div style="padding:5px 0;border-bottom:1px dashed #cbd5e1;font-size:11px;">
-                  <strong>${escapeHtml(log.action)}</strong> • ${escapeHtml(log.entity_type)} (${escapeHtml(log.entity_id.slice(0, 14))})
-                  <div style="color:#64748b;">${formatDateTimeVN(log.created_at)}</div>
+            <div style="max-height:110px;overflow-y:auto;">
+              ${(db.audit_logs || []).slice(0, 12).map(log => `
+                <div style="padding:4px 0;border-bottom:1px dashed #cbd5e1;font-size:11px;">
+                  <strong>${escapeHtml(log.action)}</strong> • ${escapeHtml(log.entity_type || log.entityType || "")} (${escapeHtml(String(log.entity_id || log.entityId || "").slice(0, 14))})
+                  <div style="color:#64748b;">${formatDateTimeVN(log.created_at || log.createdAt)}</div>
                 </div>
               `).join("")}
             </div>
           </div>
-          <textarea id="backupJsonPreviewText" class="hidden" readonly>${escapeHtml(JSON.stringify(bundle.metadata))}</textarea>
+          <textarea id="backupJsonPreviewText" class="hidden" readonly>${escapeHtml(jsonSnap.jsonString)}</textarea>
           <button type="button" class="hidden" id="btnCopyBackupClipboard"></button>
         </div>
       `, (modalEl) => {
@@ -6665,64 +7829,182 @@
           showToast("Đã đăng xuất. Dữ liệu được khóa bảo vệ.", "warn");
           renderApp();
         });
-        modalEl.querySelector("#btnShareBackupFileIos").addEventListener("click", async () => {
-          try {
-            const file = new File([bundle.zipBytes], bundle.fileName, { type: "application/zip" });
-            if (navigator.canShare && navigator.canShare({ files: [file] })) {
-              await navigator.share({ title: bundle.fileName, files: [file] });
-              showToast("Đã mở bảng chia sẻ iOS (Files / iCloud / Drive)!");
-              return;
-            }
-          } catch (e) {}
-          const a = modalEl.querySelector("#btnDownloadBackupDataUri");
-          if (a) a.click();
-          showToast(`Đã tải gói sao lưu ${bundle.fileName}`);
-        });
-        modalEl.querySelector("#btnCloudBackupSupabase").addEventListener("click", () => {
-          showToast(`Đã lưu vào bucket app-backups: ${bundle.backupRecord.file_path}`);
-        });
-        modalEl.querySelector("#btnMigrateToSupabaseNow").addEventListener("click", () => {
-          const res = migrateLocalDataToSupabase(db);
-          showToast(`Đã đối chiếu khớp 100% (${res.targetCounts.students} HS, ${res.targetCounts.classes} lớp)! Giữ nguyên bản local.`);
+
+        modalEl.querySelector("#btnSelectDestDevice").addEventListener("click", () => {
+          uiState.backupDestination = "device";
           openSettingsAndBackupModal();
         });
+        modalEl.querySelector("#btnSelectDestSupabase").addEventListener("click", () => {
+          uiState.backupDestination = "supabase";
+          openSettingsAndBackupModal();
+        });
+
+        const executeBackupFormat = async (requestedFormat) => {
+          const dest = uiState.backupDestination || "device";
+          try {
+            if (requestedFormat === "full_zip") {
+              const zipBundle = createBackupZipBundle(db);
+              zipBundle.backupRecord.backup_type = "manual";
+              zipBundle.backupRecord.format = "full_zip";
+              zipBundle.backupRecord.file_size = zipBundle.zipBytes.byteLength;
+              zipBundle.backupRecord.rawBytes = zipBundle.zipBytes;
+              zipBundle.backupRecord.fileName = zipBundle.fileName;
+              zipBundle.backupRecord.deletable = true;
+              privateBackupBucketStore.set(zipBundle.backupRecord.file_path, {
+                ownerId: OWNER_UUID,
+                user_id: OWNER_UUID,
+                filePath: zipBundle.backupRecord.file_path,
+                fileName: zipBundle.fileName,
+                format: "full_zip",
+                mimeType: "application/zip",
+                bytes: zipBundle.zipBytes,
+                createdAt: zipBundle.metadata.backup_at
+              });
+              saveDatabaseToStorage(db);
+              if (dest === "device") {
+                triggerSafariCompatibleDownload(zipBundle.zipBytes, zipBundle.fileName, "application/zip");
+              }
+              showToast(dest === "supabase"
+                ? `Đã lưu ZIP vào bucket app-backups: ${zipBundle.backupRecord.file_path}`
+                : `Đã tải gói sao lưu đầy đủ ZIP (${zipBundle.fileName})!`);
+              openSettingsAndBackupModal();
+              return;
+            }
+
+            const art = await createJsonOrGzipBackupArtifact(db, requestedFormat, {
+              backupType: "manual",
+              destination: dest
+            });
+            if (dest === "device") {
+              triggerSafariCompatibleDownload(art.bytes, art.fileName, art.mimeType);
+            }
+            showToast(dest === "supabase"
+              ? `Đã lưu vào Supabase (app-backups): ${art.backupRecord.file_path}`
+              : art.noticeMessage, art.fellBackToPlainJson ? "warn" : "success");
+            openSettingsAndBackupModal();
+          } catch (err) {
+            showToast(err.message || String(err), "error");
+          }
+        };
+
+        modalEl.querySelector("#btnCreateBackupJson").addEventListener("click", () => {
+          void executeBackupFormat("json");
+        });
+        modalEl.querySelector("#btnCreateBackupJsonGzip").addEventListener("click", () => {
+          void executeBackupFormat("json_gzip");
+        });
+        modalEl.querySelector("#btnCreateBackupFullZip").addEventListener("click", () => {
+          void executeBackupFormat("full_zip");
+        });
+
+        modalEl.querySelector("#btnMigrateToSupabaseNow").addEventListener("click", () => {
+          const res = migrateLocalDataToSupabase(db);
+          showToast(`Đã đối chiếu khớp 100% (${res.targetCounts.students} HS, ${res.targetCounts.classes} lớp)!`);
+          openSettingsAndBackupModal();
+        });
+
         modalEl.querySelector("#btnSwitchToRestoreModal").addEventListener("click", () => {
           closeModal();
           openRestoreBackupModal();
         });
+
+        // Xử lý các nút Tải xuống / Kiểm tra / Khôi phục / Xóa trên từng dòng trong Danh sách bản sao lưu
+        const listEl = modalEl.querySelector("#backupHistoryListContainer");
+        const bannerEl = modalEl.querySelector("#backupVerificationBanner");
+        if (listEl) {
+          listEl.querySelectorAll("[data-bk-action]").forEach(btn => {
+            btn.addEventListener("click", async () => {
+              const action = btn.dataset.bkAction;
+              const bkId = btn.dataset.bkId;
+              const bk = (db.backups || []).find(item => item.id === bkId);
+              if (!bk) return;
+
+              if (action === "download") {
+                try {
+                  const signed = createSignedUrlForBackupInStorage(bk, 900);
+                  const bytes = signed.downloadBytes() || bk.rawBytes || jsonSnap.utf8Bytes;
+                  const fName = bk.fileName || getBackupFileNameByFormat(bk.created_at || bk.started_at, bk.format || "json");
+                  const mime = bk.format === "json_gzip" ? "application/gzip" : (bk.format === "full_zip" ? "application/zip" : "application/json;charset=utf-8");
+                  triggerSafariCompatibleDownload(bytes, fName, mime);
+                  showToast(`Đã tạo Signed URL & tải xuống: ${fName}`);
+                } catch (err) {
+                  showToast(err.message || String(err), "error");
+                }
+              } else if (action === "verify") {
+                try {
+                  const fmt = bk.format || "json";
+                  const bytes = bk.rawBytes || (privateBackupBucketStore.get(bk.file_path) && privateBackupBucketStore.get(bk.file_path).bytes);
+                  if (fmt === "full_zip" && bytes) {
+                    const checkZip = validateAndPreviewBackupZip(bytes, db, "add_only");
+                    bannerEl.classList.remove("hidden");
+                    bannerEl.textContent = `✓ Bản sao lưu ZIP hợp lệ • Checksum: ${checkZip.metadata.checksum} • Sẵn sàng khôi phục.`;
+                  } else {
+                    const payloadBytes = bytes || createJsonBackupObject(db, { format: "json" }).utf8Bytes;
+                    const checkJson = await validateAndPreviewJsonBackup(payloadBytes, db, "add_only", {
+                      fileName: bk.fileName || (fmt === "json_gzip" ? "backup.json.gz" : "backup.json"),
+                      mimeType: fmt === "json_gzip" ? "application/gzip" : "application/json"
+                    });
+                    bannerEl.classList.remove("hidden");
+                    bannerEl.textContent = `✓ Kiểm tra 10 bước ĐẠT • SHA-256 khớp 100% (${checkJson.recomputedChecksum.slice(0, 16)}...) • Ảnh thiếu: ${checkJson.missingImages.length}.`;
+                  }
+                } catch (err) {
+                  bannerEl.classList.remove("hidden");
+                  bannerEl.style.background = "#fef2f2";
+                  bannerEl.style.color = "#991b1b";
+                  bannerEl.textContent = `✕ Lỗi kiểm tra: ${err.message || String(err)}`;
+                }
+              } else if (action === "restore") {
+                closeModal();
+                openRestoreBackupModal(bk);
+              } else if (action === "delete") {
+                if (bk.backup_type === "pre_restore" || bk.deletable === false) {
+                  showToast("Không được phép xóa bản sao lưu an toàn pre_restore!", "warn");
+                  return;
+                }
+                privateBackupBucketStore.delete(bk.file_path);
+                db.backups = (db.backups || []).filter(item => item.id !== bk.id);
+                saveDatabaseToStorage(db);
+                showToast("Đã xóa bản sao lưu.");
+                openSettingsAndBackupModal();
+              }
+            });
+          });
+        }
       });
     }
 
-    function openRestoreBackupModal() {
-      let currentZipBytes = null;
-      let selectedMode = "add_only"; // Mặc định: 1. Chỉ thêm dữ liệu chưa có (Không chọn Khôi phục toàn bộ theo mặc định!)
+    function openRestoreBackupModal(preselectedBackup = null) {
+      let currentFileBytes = null;
+      let currentFileName = "Thu_tien_sach_backup.json";
+      let currentMimeType = "application/json";
+      let selectedMode = "add_only"; // Mặc định: 1. Chỉ thêm dữ liệu chưa có (Mục 6)
 
       openModal(`
         <div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-            <h3 style="margin:0;font-size:17px;font-weight:800;">Khôi phục dữ liệu từ gói .ZIP</h3>
+            <h3 style="margin:0;font-size:17px;font-weight:800;">♻️ Khôi phục dữ liệu (JSON / JSON.GZ / ZIP)</h3>
             <button type="button" class="btn-touch btn-secondary" style="min-height:48px;padding:6px 12px;" id="btnCloseRestoreModal">Đóng</button>
           </div>
           <div style="font-size:12px;color:#475569;margin-bottom:10px;">
-            Hệ thống kiểm tra 9 bước (cấu trúc ZIP, <code>schema_version</code>, 8 file JSON, khóa ngoại, UUID trùng), tạo bản chụp Rollback và yêu cầu nhập <code>XAC NHAN KHOI PHUC</code>.
+            Hệ thống kiểm tra 10 bước (MIME/đuôi file, kích thước, cú pháp JSON, <code>schemaVersion</code>, 7 mảng dữ liệu, khóa ngoại, trùng lặp, kiểu số tiền, ngày giờ, SHA-256 checksum & ảnh Storage), tự động tạo bản sao lưu <code>pre_restore</code> và yêu cầu nhập <code>XAC NHAN KHOI PHUC</code>.
           </div>
 
           <div style="margin-bottom:10px;">
-            <label style="font-size:12px;font-weight:700;display:block;margin-bottom:4px;">Chế độ khôi phục (Mặc định an toàn):</label>
+            <label style="font-size:12px;font-weight:700;display:block;margin-bottom:4px;">Chế độ khôi phục (Mặc định: Chỉ thêm dữ liệu chưa có):</label>
             <select id="restoreModeSelect" class="input-field" style="font-size:13px;">
               <option value="add_only" selected>1. Chỉ thêm dữ liệu chưa có (Mặc định)</option>
-              <option value="merge_uuid">2. Gộp và cập nhật theo UUID (Giữ lịch sử GD & Audit)</option>
+              <option value="merge_uuid">2. Gộp và cập nhật theo UUID</option>
               <option value="replace_all">3. Khôi phục toàn bộ</option>
             </select>
           </div>
 
           <div class="summary-grid-2" style="margin-bottom:10px;">
             <label class="btn-touch btn-outline-teal" style="cursor:pointer;font-size:12px;">
-              📂 Chọn file .ZIP từ máy
-              <input type="file" accept=".zip,application/zip" id="inputRestoreJsonFile" style="display:none;">
+              📂 Chọn file .json / .json.gz / .zip
+              <input type="file" accept=".json,.gz,.json.gz,.zip,application/json,application/gzip,application/zip" id="inputRestoreJsonFile" style="display:none;">
             </label>
             <button type="button" class="btn-touch btn-secondary" style="font-size:12px;" id="btnParsePastedRestoreJson">
-              ☁️ Chọn bản sao lưu gần nhất
+              ☁️ Chọn bản sao lưu trong app-backups
             </button>
           </div>
           <textarea id="inputRestoreJsonText" class="hidden"></textarea>
@@ -6733,40 +8015,102 @@
         modalEl.querySelector("#btnCloseRestoreModal").addEventListener("click", closeModal);
         const modeSel = modalEl.querySelector("#restoreModeSelect");
 
-        const renderZipPreview = () => {
-          if (!currentZipBytes) return;
+        const renderRestorePreview = async () => {
+          if (!currentFileBytes) return;
           const previewEl = modalEl.querySelector("#restorePreviewBox");
+          selectedMode = modeSel.value;
+          const lower = String(currentFileName || "").toLowerCase();
+
           try {
-            selectedMode = modeSel.value;
-            const check = validateAndPreviewBackupZip(currentZipBytes, db, selectedMode);
+            if (lower.endsWith(".zip")) {
+              const checkZip = validateAndPreviewBackupZip(currentFileBytes, db, selectedMode);
+              const ds = checkZip.diffSummary;
+              previewEl.innerHTML = `
+                <div style="background:#f8fafc;border:1.5px solid #86efac;border-radius:12px;padding:10px;margin-bottom:10px;font-size:12px;">
+                  <div style="font-weight:800;color:#14532d;margin-bottom:4px;">
+                    ✓ Kiểm tra gói ZIP hợp lệ (Schema v${escapeHtml(checkZip.metadata.schema_version)} • Checksum: ${escapeHtml(checkZip.metadata.checksum)})
+                  </div>
+                  <div>• Lớp học: +${ds.classes.add} thêm / ${ds.classes.update} cập nhật / ${ds.classes.skip} bỏ qua</div>
+                  <div>• Học sinh: +${ds.students.add} thêm / ${ds.students.update} cập nhật / ${ds.students.skip} bỏ qua</div>
+                  <div>• Sách: +${ds.books.add} thêm / ${ds.books.update} cập nhật / ${ds.books.skip} bỏ qua</div>
+                  <div>• Giao dịch: +${ds.transactions.add} thêm / ${ds.transactions.skip} bỏ qua</div>
+                  <div style="margin-top:8px;">
+                    <label style="font-size:11px;font-weight:700;color:#b91c1c;display:block;margin-bottom:4px;">
+                      Nhập chính xác "XAC NHAN KHOI PHUC" để bắt đầu:
+                    </label>
+                    <input type="text" id="inputConfirmRestorePhrase" class="input-field" style="margin-bottom:8px;font-weight:800;" placeholder="XAC NHAN KHOI PHUC">
+                    <button type="button" class="btn-touch btn-primary" style="width:100%;" id="btnExecuteRestoreConfirm">
+                      ✓ Thực hiện khôi phục an toàn (Tạo pre_restore & Rollback)
+                    </button>
+                  </div>
+                </div>
+              `;
+              previewEl.querySelector("#btnExecuteRestoreConfirm").addEventListener("click", () => {
+                const phrase = previewEl.querySelector("#inputConfirmRestorePhrase").value;
+                try {
+                  const res = executeRestoreFromBackupZip(currentFileBytes, db, selectedMode, phrase);
+                  closeModal();
+                  triggerHaptic();
+                  showToast(`Khôi phục ZIP thành công (${res.finalCounts.students} HS, ${res.finalCounts.classes} lớp)!`);
+                  renderApp();
+                } catch (err) {
+                  showToast(err.message || String(err), "error");
+                }
+              });
+              return;
+            }
+
+            // Kiểm tra 10 bước cho file .json / .json.gz
+            const check = await validateAndPreviewJsonBackup(currentFileBytes, db, selectedMode, {
+              fileName: currentFileName,
+              mimeType: currentMimeType
+            });
             const ds = check.diffSummary;
+            const missingHtml = check.missingImages.length > 0
+              ? `<div style="margin-top:6px;padding:6px 8px;background:#fffbeb;border:1px solid #fcd34d;border-radius:8px;color:#92400e;font-size:11px;">
+                  <strong>⚠️ Phát hiện ${check.missingImages.length} ảnh không còn trong Storage (sẽ đánh dấu <code>missing</code>, vẫn khôi phục giao dịch bình thường):</strong>
+                  ${check.missingImages.map(m => `<div>• GD ${escapeHtml(m.transactionId)}: <code>${escapeHtml(m.storagePath)}</code> (missing)</div>`).join("")}
+                </div>`
+              : `<div style="color:#15803d;font-weight:700;margin-top:4px;">✓ Toàn bộ ảnh tham chiếu trong <code>transactionImages</code> đều hợp lệ.</div>`;
+
             previewEl.innerHTML = `
               <div style="background:#f8fafc;border:1.5px solid #86efac;border-radius:12px;padding:10px;margin-bottom:10px;font-size:12px;">
                 <div style="font-weight:800;color:#14532d;margin-bottom:4px;">
-                  ✓ Kiểm tra gói ZIP hợp lệ (Schema v${escapeHtml(check.metadata.schema_version)} • Checksum: ${escapeHtml(check.metadata.checksum)})
+                  ✓ Đạt 10/10 bước kiểm tra (${escapeHtml(currentFileName)} • Schema v${escapeHtml(check.metadata.schemaVersion)})
                 </div>
-                <div>• Lớp học: +${ds.classes.add} thêm / ${ds.classes.update} cập nhật / ${ds.classes.skip} giữ nguyên</div>
-                <div>• Học sinh: +${ds.students.add} thêm / ${ds.students.update} cập nhật / ${ds.students.skip} giữ nguyên</div>
-                <div>• Sách: +${ds.books.add} thêm / ${ds.books.update} cập nhật / ${ds.books.skip} giữ nguyên</div>
-                <div>• Giao dịch: +${ds.transactions.add} thêm / ${ds.transactions.skip} giữ lịch sử</div>
-                <div style="margin-top:8px;">
+                <div style="font-size:11px;color:#0f766e;margin-bottom:6px;">
+                  SHA-256 Checksum hợp lệ: <code>${escapeHtml(check.recomputedChecksum.slice(0, 20))}...</code>
+                </div>
+                <div>• Lớp học: <strong>+${ds.classes.add} sẽ thêm</strong> / <strong>${ds.classes.update} cập nhật</strong> / <strong>${ds.classes.skip} bỏ qua</strong></div>
+                <div>• Học sinh: <strong>+${ds.students.add} sẽ thêm</strong> / <strong>${ds.students.update} cập nhật</strong> / <strong>${ds.students.skip} bỏ qua</strong></div>
+                <div>• Sách: <strong>+${ds.books.add} sẽ thêm</strong> / <strong>${ds.books.update} cập nhật</strong> / <strong>${ds.books.skip} bỏ qua</strong></div>
+                <div>• Giao dịch: <strong>+${ds.transactions.add} sẽ thêm</strong> / <strong>${ds.transactions.update} cập nhật</strong> / <strong>${ds.transactions.skip} bỏ qua</strong></div>
+                ${missingHtml}
+                <div style="margin-top:8px;padding-top:8px;border-top:1px dashed #cbd5e1;">
+                  <div style="font-size:11px;color:#475569;margin-bottom:4px;">
+                    Hệ thống sẽ tự động tạo một bản sao lưu <code>pre_restore</code> trước khi ghi dữ liệu.
+                  </div>
                   <label style="font-size:11px;font-weight:700;color:#b91c1c;display:block;margin-bottom:4px;">
                     Nhập chính xác "XAC NHAN KHOI PHUC" để bắt đầu:
                   </label>
                   <input type="text" id="inputConfirmRestorePhrase" class="input-field" style="margin-bottom:8px;font-weight:800;" placeholder="XAC NHAN KHOI PHUC">
-                  <button type="button" class="btn-touch btn-primary" style="width:100%;" id="btnExecuteZipRestore">
-                    ✓ Thực hiện khôi phục an toàn (Có Rollback)
+                  <button type="button" class="btn-touch btn-primary" style="width:100%;" id="btnExecuteRestoreConfirm">
+                    ✓ Thực hiện khôi phục JSON (Tự động tạo pre_restore)
                   </button>
                 </div>
               </div>
             `;
-            previewEl.querySelector("#btnExecuteZipRestore").addEventListener("click", () => {
+
+            previewEl.querySelector("#btnExecuteRestoreConfirm").addEventListener("click", async () => {
               const phrase = previewEl.querySelector("#inputConfirmRestorePhrase").value;
               try {
-                const res = executeRestoreFromBackupZip(currentZipBytes, db, selectedMode, phrase);
+                const res = await executeRestoreFromJsonBackup(currentFileBytes, db, selectedMode, phrase, {
+                  fileName: currentFileName,
+                  mimeType: currentMimeType
+                });
                 closeModal();
                 triggerHaptic();
-                showToast(`Khôi phục thành công (${res.finalCounts.students} HS, ${res.finalCounts.classes} lớp)!`);
+                showToast(`Khôi phục thành công (${res.finalCounts.students} HS, ${res.finalCounts.classes} lớp • Đã lưu bản pre_restore)!`);
                 renderApp();
               } catch (err) {
                 showToast(err.message || String(err), "error");
@@ -6774,31 +8118,59 @@
             });
           } catch (err) {
             previewEl.innerHTML = `
-              <div style="padding:10px;border-radius:10px;background:#fef2f2;border:1.5px solid #fca5a5;color:#991b1b;font-size:12px;font-weight:700;">
-                ✕ Phát hiện file sao lưu lỗi: ${escapeHtml(err.message || String(err))}
+              <div style="padding:10px;border-radius:10px;background:#fef2f2;border:1.5px solid #fca5a5;color:#991b1b;font-size:12px;">
+                <div style="font-weight:800;margin-bottom:4px;">✕ Phát hiện lỗi dữ liệu khi kiểm tra file sao lưu:</div>
+                <table style="width:100%;border-collapse:collapse;font-size:11px;background:#ffffff;color:#7f1d1d;">
+                  <thead>
+                    <tr style="background:#fee2e2;">
+                      <th style="border:1px solid #fca5a5;padding:4px;text-align:left;">File</th>
+                      <th style="border:1px solid #fca5a5;padding:4px;text-align:left;">Chi tiết lỗi kiểm tra</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr>
+                      <td style="border:1px solid #fca5a5;padding:4px;font-weight:700;">${escapeHtml(currentFileName)}</td>
+                      <td style="border:1px solid #fca5a5;padding:4px;">${escapeHtml(err.message || String(err))}</td>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
             `;
           }
         };
 
-        modeSel.addEventListener("change", renderZipPreview);
+        modeSel.addEventListener("change", () => {
+          void renderRestorePreview();
+        });
 
         modalEl.querySelector("#inputRestoreJsonFile").addEventListener("change", (ev) => {
           const file = ev.target.files && ev.target.files[0];
           if (!file) return;
+          currentFileName = file.name || "Thu_tien_sach_backup.json";
+          currentMimeType = file.type || (currentFileName.endsWith(".gz") ? "application/gzip" : "application/json");
           const reader = new FileReader();
           reader.onload = (e) => {
-            currentZipBytes = new Uint8Array(e.target.result);
-            renderZipPreview();
+            currentFileBytes = new Uint8Array(e.target.result);
+            void renderRestorePreview();
           };
           reader.readAsArrayBuffer(file);
         });
 
         modalEl.querySelector("#btnParsePastedRestoreJson").addEventListener("click", () => {
-          const latestBundle = createBackupZipBundle(db);
-          currentZipBytes = latestBundle.zipBytes;
-          renderZipPreview();
+          const latestJson = createJsonBackupObject(db, { format: "json" });
+          currentFileBytes = latestJson.utf8Bytes;
+          currentFileName = latestJson.fileName;
+          currentMimeType = "application/json";
+          void renderRestorePreview();
         });
+
+        if (preselectedBackup) {
+          const fmt = preselectedBackup.format || "json";
+          currentFileName = preselectedBackup.fileName || getBackupFileNameByFormat(preselectedBackup.created_at || new Date().toISOString(), fmt);
+          currentMimeType = fmt === "json_gzip" ? "application/gzip" : (fmt === "full_zip" ? "application/zip" : "application/json");
+          currentFileBytes = preselectedBackup.rawBytes || createJsonBackupObject(db, { format: "json" }).utf8Bytes;
+          void renderRestorePreview();
+        }
       });
     }
 

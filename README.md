@@ -45,3 +45,18 @@ Xem chi tiết hướng dẫn triển khai từng bước tại:
 - [`DEPLOYMENT.md`](./DEPLOYMENT.md) — Hướng dẫn Publish 15 bước lên GitHub, Supabase và Vercel
 - [`SUPABASE_SETUP.md`](./SUPABASE_SETUP.md) — Hướng dẫn thiết lập Database SQL, RLS, Auth & Storage Buckets
 - [`BACKUP_RESTORE.md`](./BACKUP_RESTORE.md) — Hướng dẫn Sao lưu thủ công, Sao lưu tự động hằng tuần & Khôi phục an toàn
+
+
+## 8. Hệ thống Sao lưu & Khôi phục JSON / JSON.GZ / ZIP (Bản cập nhật v2.1.0)
+- **3 hình thức sao lưu**:
+  1. **Sao lưu nhanh dạng JSON (`.json`)**: UTF-8, nhanh, dễ kiểm tra, không nhúng ảnh Base64 (chỉ lưu metadata ảnh & `storagePath`).
+  2. **Sao lưu nén dạng JSON.GZ (`.json.gz`)**: Nén bằng Web API gốc `CompressionStream('gzip')`, tự động chuyển về `.json` thường và thông báo rõ nếu trình duyệt không hỗ trợ.
+  3. **Sao lưu đầy đủ dạng ZIP (`.zip`)**: Giữ nguyên chức năng sao lưu gói ZIP 8 file.
+- **Quy trình Canonicalize & tính SHA-256 Checksum**:
+  1. Tạo đối tượng dữ liệu gồm `metadata` (loại trừ trường `checksum`) và 7 mảng dữ liệu (`classes`, `students`, `books`, `transactions`, `transactionImages`, `auditLogs`, `settings`).
+  2. Sắp xếp đệ quy toàn bộ key của mọi object theo thứ tự từ điển (`canonicalizeValue`) và tuần tự hóa bằng `JSON.stringify` không khoảng trắng thừa.
+  3. Băm chuỗi UTF-8 bằng `crypto.subtle.digest('SHA-256')` tạo chuỗi 64 ký tự hex.
+- **Migration SQL cần chạy**:
+  - `supabase/migrations/20261111000001_init_schema_and_rls.sql`
+  - `supabase/migrations/20261111000002_weekly_auto_backup_cron.sql`
+  - `supabase/migrations/20261111000003_json_backup_and_restore.sql` (Mới)

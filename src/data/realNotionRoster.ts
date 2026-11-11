@@ -1,4 +1,4 @@
-import { ClassSeedInput, StudentSeedInput, ClassRecord, StudentRecord } from '../types/database';
+import { BookRecord, ClassSeedInput, StudentSeedInput, ClassRecord, StudentRecord } from '../types/database';
 
 export const INITIAL_REAL_CLASSES: ClassSeedInput[] = [
   {
@@ -1599,6 +1599,8 @@ export const INITIAL_REAL_STUDENTS: StudentSeedInput[] = [
  * Gắn ownerId (lấy từ user.id của Supabase Auth) vào dữ liệu nguồn Notion
  * để tạo thành ClassRecord[] và StudentRecord[] hợp lệ.
  */
+export const INITIAL_REAL_BOOKS: Omit<BookRecord, 'ownerId'>[] = [];
+
 export function attachOwnerToRoster(
   ownerId: string,
   seedClasses: ClassSeedInput[] = INITIAL_REAL_CLASSES,

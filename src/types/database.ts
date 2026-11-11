@@ -21,9 +21,16 @@ export type PaymentStatusLabel =
   | 'Đã trả sách'
   | 'Đã hủy';
 
+export type BackupFormat = 'json' | 'json_gzip' | 'full_zip';
+
+export type BackupType = 'manual' | 'automatic' | 'pre_restore' | 'pre_update';
+
+export type BackupStorageDestination = 'device' | 'supabase';
+
+export type RestoreMode = 'add_only' | 'merge_uuid' | 'replace_all';
+
 /**
  * Kiểu dữ liệu nguồn nhập lớp học từ Notion (chưa gắn ownerId).
- * Khi lưu vào ứng dụng hoặc đồng bộ lên Supabase, service sẽ lấy user.id từ supabase.auth.getUser() để gắn thành ownerId.
  */
 export interface ClassSeedInput {
   id: string;
@@ -103,6 +110,7 @@ export interface TransactionRecord {
   type: TransactionType;
   paymentMethod: PaymentMethod;
   imageId: string;
+  missingImage?: boolean;
   createdAt: string;
   updatedAt?: string;
   note: string;
@@ -112,17 +120,40 @@ export interface TransactionRecord {
   refTransactionId: string;
 }
 
+/**
+ * Metadata của ảnh giao dịch trong database và trong bản sao lưu JSON (Tuyệt đối không lưu Base64 hay Signed URL).
+ */
 export interface TransactionImageRecord {
   id: string;
   ownerId: string;
   transactionId: string;
   bucketName: 'transaction-images';
   storagePath: string;
+  originalFileName: string;
   mimeType: string;
   fileSizeBytes: number;
+  checksum: string;
   width?: number;
   height?: number;
+  missingInStorage?: boolean;
   createdAt: string;
+}
+
+/**
+ * Cấu trúc metadata của ảnh xuất trong mảng `transactionImages` của file sao lưu JSON/JSON.GZ (Mục 2).
+ */
+export interface BackupTransactionImageMetadata {
+  id: string;
+  transactionId: string;
+  bucket: 'transaction-images';
+  storagePath: string;
+  originalFileName: string;
+  mimeType: string;
+  size: number;
+  checksum: string;
+  createdAt: string;
+  createdBy: string;
+  missing?: boolean;
 }
 
 export interface AuditLogRecord {
@@ -136,23 +167,149 @@ export interface AuditLogRecord {
   createdAt: string;
 }
 
+export interface SafeSettingBackupRecord {
+  id: string;
+  ownerId: string;
+  appName: string;
+  currency: 'VND';
+  timezone: 'Asia/Ho_Chi_Minh';
+  autoBackupEnabled: boolean;
+  autoBackupCronConfigured: boolean;
+  migrationCompleted: boolean;
+  migratedAt?: string | null;
+  updatedAt: string;
+}
+
+export interface BackupRecordCounts {
+  classes: number;
+  students: number;
+  books: number;
+  transactions: number;
+  transactionImages: number;
+  auditLogs: number;
+  settings: number;
+}
+
+/**
+ * Cấu trúc `metadata` bên trong file sao lưu JSON / JSON.GZ (Mục 1 & Mục 9).
+ */
+export interface JsonBackupMetadata {
+  schemaVersion: string;
+  appVersion: string;
+  backupVersion: string;
+  createdAt: string;
+  createdBy: string;
+  format: BackupFormat;
+  canonicalAlgorithm: string;
+  recordCounts: BackupRecordCounts;
+  checksum: string;
+}
+
+/**
+ * Cấu trúc đầy đủ của file sao lưu JSON / JSON.GZ (Mục 1).
+ */
+export interface JsonBackupPayload {
+  metadata: JsonBackupMetadata;
+  classes: ClassRecord[];
+  students: StudentRecord[];
+  books: BookRecord[];
+  transactions: TransactionRecord[];
+  transactionImages: BackupTransactionImageMetadata[];
+  auditLogs: AuditLogRecord[];
+  settings: SafeSettingBackupRecord[];
+}
+
+/**
+ * Bản ghi lịch sử sao lưu ở Frontend (ánh xạ với bảng `public.backups` trong Mục 4).
+ */
 export interface BackupRecord {
   id: string;
   ownerId: string;
-  backupType: 'manual_local' | 'manual_cloud' | 'auto_weekly' | 'pre_restore_snapshot';
+  backupType: BackupType;
+  format: BackupFormat;
+  schemaVersion: string;
+  appVersion: string;
   status: 'pending' | 'completed' | 'failed';
   startedAt: string;
   completedAt?: string;
-  recordCounts: Record<string, number>;
   filePath: string;
+  fileSize: number;
   checksum: string;
-  errorMessage?: string;
+  recordCounts: BackupRecordCounts;
+  errorMessage: string;
   createdAt: string;
+  deletable?: boolean;
+}
+
+export interface BackupDbRow {
+  id: string;
+  owner_id: string;
+  user_id?: string;
+  backup_type: BackupType;
+  format: BackupFormat;
+  schema_version: string;
+  app_version: string;
+  status: 'pending' | 'completed' | 'failed';
+  started_at: string;
+  completed_at: string | null;
+  file_path: string;
+  file_size: number;
+  checksum: string;
+  record_counts: BackupRecordCounts;
+  error_message: string;
+  created_at: string;
+}
+
+export interface TableDiffCount {
+  add: number;
+  update: number;
+  skip: number;
+  totalIncoming: number;
+}
+
+export interface RestoreDiffSummary {
+  classes: TableDiffCount;
+  students: TableDiffCount;
+  books: TableDiffCount;
+  transactions: TableDiffCount;
+  transactionImages: TableDiffCount;
+  auditLogs: TableDiffCount;
+  settings: TableDiffCount;
+}
+
+export interface RestoreValidationIssue {
+  step: number;
+  code: string;
+  field: string;
+  message: string;
+  fatal: boolean;
+}
+
+export interface RestorePreviewResult {
+  valid: boolean;
+  mode: RestoreMode;
+  metadata: JsonBackupMetadata | null;
+  checksumVerified: boolean;
+  computedChecksum: string;
+  diffSummary: RestoreDiffSummary;
+  missingImages: BackupTransactionImageMetadata[];
+  issues: RestoreValidationIssue[];
+  parsedPayload: JsonBackupPayload | null;
+}
+
+export interface RestoreExecutionResult {
+  ok: boolean;
+  mode: RestoreMode;
+  preRestoreBackup: BackupRecord;
+  diffSummary: RestoreDiffSummary;
+  missingImages: BackupTransactionImageMetadata[];
+  finalCounts: BackupRecordCounts;
+  rolledBack: boolean;
+  issues: RestoreValidationIssue[];
 }
 
 /**
  * Kiểu dữ liệu dòng bảng trong Supabase PostgreSQL (snake_case, bắt buộc có owner_id).
- * Ánh xạ 1-1: Frontend `ownerId` <-> Database `owner_id`.
  */
 export interface ClassDbRow {
   id: string;
